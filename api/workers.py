@@ -1,10 +1,13 @@
-import asyncio
+try:
+    from database import async_redis_client
+except ModuleNotFoundError:
+    from api.database import async_redis_client
 import httpx
 import json
 import websockets
 import math
 from datetime import datetime, timezone
-from database import async_redis_client
+
 
 # ══════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -29,14 +32,6 @@ WS_URI = (
 
 # ══════════════════════════════════════════════════════════════════
 #  FEAR & GREED — tự tính theo thuật toán chuẩn
-#
-#  Công thức giống alternative.me / CoinMarketCap:
-#  1. Volatility        25% — so sánh std dev giá BTC 30d vs 90d
-#  2. Market Momentum   25% — volume 30d so với trung bình + price change
-#  3. Social Media      15% — Reddit + Twitter mentions (approx)
-#  4. Dominance         10% — BTC dominance (cao = Fear)
-#  5. Trends            10% — Google Trends BTC (approx từ price action)
-#  6. Market Cap Change 15% — total market cap 24h change
 # ══════════════════════════════════════════════════════════════════
 async def calculate_fear_greed(client: httpx.AsyncClient) -> dict:
     scores = {}
@@ -59,15 +54,12 @@ async def calculate_fear_greed(client: httpx.AsyncClient) -> dict:
             vol_30 = _std(returns[-30:]) if len(returns) >= 30 else 0
             vol_90 = _std(returns)       if len(returns) >= 60 else vol_30
 
-            # Volatility thấp hơn trung bình → Greed, cao hơn → Fear
             if vol_90 > 0:
                 vol_ratio = vol_30 / vol_90
-                # vol_ratio < 1 → bình thường/greed, > 1 → fear
                 vol_score = max(0, min(100, int(100 - (vol_ratio - 0.5) * 80)))
             else:
                 vol_score = 50
 
-            # Price momentum 30d
             if len(closes) >= 30:
                 price_change_30d = (closes[-1] - closes[-30]) / closes[-30]
                 momentum_score   = max(0, min(100, int(50 + price_change_30d * 200)))
@@ -77,7 +69,6 @@ async def calculate_fear_greed(client: httpx.AsyncClient) -> dict:
             scores["volatility"] = vol_score
             scores["momentum"]   = momentum_score
 
-            # Volume momentum (so sánh 7d vs 30d)
             volumes  = [float(k[5]) for k in klines]
             vol7d    = sum(volumes[-7:])  / 7  if len(volumes) >= 7  else 0
             vol30d   = sum(volumes[-30:]) / 30 if len(volumes) >= 30 else vol7d
@@ -101,12 +92,9 @@ async def calculate_fear_greed(client: httpx.AsyncClient) -> dict:
             btc_dom  = float(d.get("market_cap_percentage", {}).get("btc", 50))
             total_ch = float(d.get("market_cap_change_percentage_24h_usd", 0))
 
-            # BTC dom > 55% → thị trường sợ hãi (chạy về BTC)
-            # BTC dom < 40% → altcoin season → greed
             dom_score = max(0, min(100, int(100 - (btc_dom - 40) * 2)))
             scores["dominance"] = dom_score
 
-            # Total market cap change (15%)
             mktcap_score = max(0, min(100, int(50 + total_ch * 3)))
             scores["market_cap"] = mktcap_score
 
@@ -116,7 +104,6 @@ async def calculate_fear_greed(client: httpx.AsyncClient) -> dict:
         scores["market_cap"] = 50
 
     # ── 3. Social / Trends approx (15%) ──────────────────────────
-    # Dùng price action ngắn hạn làm proxy cho social sentiment
     try:
         resp = await client.get(
             "https://api.binance.com/api/v3/ticker/24hr",
@@ -125,16 +112,12 @@ async def calculate_fear_greed(client: httpx.AsyncClient) -> dict:
         if resp.status_code == 200:
             t        = resp.json()
             pct_24h  = float(t.get("priceChangePercent", 0))
-            # Giá tăng → social positive → greed
             social_score = max(0, min(100, int(50 + pct_24h * 4)))
             scores["social"] = social_score
     except Exception as e:
         print(f"[F&G] Social proxy lỗi: {e}")
         scores["social"] = 50
 
-    # ── Tổng hợp có trọng số ──────────────────────────────────────
-    #  Volatility  25%, Momentum  25%, Volume  15%
-    #  Dominance   10%, MarketCap 15%, Social  10%
     weights = {
         "volatility": 0.25,
         "momentum":   0.25,
@@ -166,7 +149,6 @@ async def calculate_fear_greed(client: httpx.AsyncClient) -> dict:
 
 
 def _std(data: list) -> float:
-    """Standard deviation."""
     if len(data) < 2:
         return 0.0
     n    = len(data)
@@ -178,11 +160,6 @@ def _std(data: list) -> float:
 #  WORKER 1: FEAR & GREED
 # ══════════════════════════════════════════════════════════════════
 async def fetch_fear_and_greed():
-    """
-    Tự tính Fear & Greed theo thuật toán chuẩn.
-    Fallback về alternative.me nếu tính lỗi.
-    Cập nhật mỗi 1 giờ.
-    """
     while True:
         success = False
         try:
@@ -205,7 +182,6 @@ async def fetch_fear_and_greed():
         except Exception as e:
             print(f"[F&G] Tự tính lỗi: {e}")
 
-        # ── Fallback: alternative.me ──────────────────────────────
         if not success:
             try:
                 async with httpx.AsyncClient(timeout=10) as client:
@@ -229,19 +205,14 @@ async def fetch_fear_and_greed():
             except Exception as e:
                 print(f"[F&G] Fallback lỗi: {e}")
 
-        await asyncio.sleep(3600)  # 1 giờ
+        await asyncio.sleep(3600)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  WORKER 2: TOP 24 COINS
+#  WORKER 2: TOP 24 COINS (Sửa lỗi HTTP 400)
 # ══════════════════════════════════════════════════════════════════
 async def fetch_top_coins():
-    """
-    Ticker 24h của 24 coin từ Binance.
-    Cập nhật mỗi 5 phút.
-    """
-    symbols_json = json.dumps(TOP_COINS)
-    url = f"https://api.binance.com/api/v3/ticker/24hr?symbols={symbols_json}"
+    base_url = "https://api.binance.com/api/v3/ticker/24hr"
 
     name_map = {
         "BTCUSDT": "Bitcoin",          "ETHUSDT": "Ethereum",
@@ -261,7 +232,11 @@ async def fetch_top_coins():
     while True:
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(url)
+                # SỬA QUAN TRỌNG: Thêm separators=(',', ':') để xóa khoảng trắng sau dấu phẩy
+                resp = await client.get(
+                    base_url, 
+                    params={"symbols": json.dumps(TOP_COINS, separators=(',', ':'))}
+                )
 
             if resp.status_code == 200:
                 data = resp.json()
@@ -280,7 +255,7 @@ async def fetch_top_coins():
                 )
                 print(f"[Coins] Cập nhật {len(data)} coins ✓")
             else:
-                print(f"[Coins] Binance HTTP {resp.status_code}")
+                print(f"[Coins] Binance HTTP {resp.status_code}: {resp.text}")
 
         except Exception as e:
             print(f"[Coins] Lỗi: {e}")
@@ -292,10 +267,6 @@ async def fetch_top_coins():
 #  WORKER 3: LIVE PRICE WebSocket
 # ══════════════════════════════════════════════════════════════════
 async def binance_live_price_worker():
-    """
-    Stream realtime 8 coin qua Binance WebSocket kline_1m.
-    Exponential backoff khi mất kết nối.
-    """
     retry_delay = 5
 
     while True:
