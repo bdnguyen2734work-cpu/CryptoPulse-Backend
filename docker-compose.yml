@@ -143,6 +143,8 @@ services:
       - .env
     ports:
       - "8000:8000"
+    volumes:
+      - ./static:/app/static
     environment:
       MYSQL_HOST: mysql
       MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}

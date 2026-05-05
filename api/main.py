@@ -1,4 +1,6 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Path, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Path, Depends, File, UploadFile
+from fastapi.staticfiles import StaticFiles
+import shutil
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from contextlib import asynccontextmanager
@@ -8,14 +10,23 @@ from passlib.context import CryptContext
 import asyncio, json, httpx, os, re, time
 import xml.etree.ElementTree as ET
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta  # type: ignore
 import jwt
 import feedparser
+import secrets
+import string
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth
 from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
-from database import get_db_connection, async_redis_client
-from workers import start_all_workers
-
+try:
+    from database import get_db_connection, async_redis_client
+    from workers import start_all_workers
+except ModuleNotFoundError:
+    from api.database import get_db_connection, async_redis_client
+    from api.workers import start_all_workers
+from google.oauth2 import id_token
+from google.auth.transport import requests
 # ══════════════════════════════════════════════════════════════════
 #  1. CẤU HÌNH
 # ══════════════════════════════════════════════════════════════════
@@ -71,13 +82,11 @@ def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
 def verify_password(plain: str, hashed: str) -> bool:
-    # Tương thích ngược với SHA256 cũ (admin legacy)
     try:
         if pwd_context.verify(plain, hashed):
             return True
     except Exception:
         pass
-    # Fallback SHA256 cho tài khoản cũ
     import hashlib
     return hashlib.sha256(plain.encode()).hexdigest() == hashed
 
@@ -141,25 +150,42 @@ def _extract_coins_from_text(text: str) -> list:
 async def _fetch_cryptocompare() -> list:
     try:
         async with httpx.AsyncClient(timeout=12) as client:
-            res = await client.get("https://min-api.cryptocompare.com/data/v2/news/",
-                                   params={"lang":"EN","sortOrder":"latest"})
+            res = await client.get(
+                "https://min-api.cryptocompare.com/data/v2/news/",
+                params={"lang": "EN", "sortOrder": "latest"}
+            )
+        
         if res.status_code != 200: return []
+        news_json = res.json()
+        news_data = news_json.get("Data") or []
+
+        if isinstance(news_data, dict):
+            news_data = list(news_data.values())
+        
         result = []
-        for item in res.json().get("Data",[])[:20]:
-            title = item.get("title",""); body = item.get("body","")
-            if not _is_whale_news(title, body): continue
+        for item in news_data[:20]:
+            title = item.get("title", "")
+            body = item.get("body", "")
+            
+            if not _is_whale_news(title, body):
+                continue
+                
             result.append({
                 "title":     title,
-                "summary":   re.sub(r"<[^>]+>","",body)[:400],
-                "url":       item.get("url",""),
-                "source":    item.get("source","CryptoCompare"),
-                "image":     item.get("imageurl",""),
-                "published": datetime.fromtimestamp(item.get("published_on",0),tz=timezone.utc).isoformat(),
-                "coins":     _extract_coins_from_text(title+" "+body),
+                "summary":   re.sub(r"<[^>]+>", "", body)[:400],
+                "url":       item.get("url", ""),
+                "source":    item.get("source", "CryptoCompare"),
+                "image":     item.get("imageurl", ""),
+                "published": datetime.fromtimestamp(
+                                item.get("published_on", 0), 
+                                tz=timezone.utc
+                             ).isoformat(),
+                "coins":     _extract_coins_from_text(title + " " + body),
             })
         return result
     except Exception as e:
-        print(f"[CC] Lỗi: {e}"); return []
+        print(f"[CC] Lỗi hệ thống: {e}")
+        return []
 
 async def _fetch_coindesk() -> list:
     try:
@@ -237,6 +263,8 @@ async def _fetch_cryptopanic() -> list:
                 f"&currencies=BTC,ETH,BNB,SOL,XRP,ADA,DOGE,AVAX,DOT,LINK&regions=en"
             )
         if resp.status_code not in (200,): return []
+        panic_json = resp.json()
+        panic_data = panic_json.get("results") or []
         result = []
         for item in resp.json().get("results",[]):
             title = item.get("title",""); desc = item.get("description","") or ""
@@ -266,25 +294,42 @@ async def _build_whale_news_payload() -> dict:
     cc,cd,ct,cp = await asyncio.gather(
         _fetch_cryptocompare(), _fetch_coindesk(),
         _fetch_cointelegraph(), _fetch_cryptopanic(),
+        return_exceptions=True
     )
-    all_news = cc + cd + ct + cp
+    sources = []
+    for s in [cc, cd, ct, cp]:
+        if isinstance(s, Exception):
+            print(f"[Whale] Source lỗi: {s}")
+            continue
+        sources += s
+
+    all_news = sources
+
     seen, unique = set(), []
     for n in all_news:
         key = n["title"].lower()[:60]
         if key not in seen:
             seen.add(key); unique.append(n)
+
     unique.sort(key=lambda x: x.get("published",""), reverse=True)
     top40 = unique[:40]
+
     print(f"[Whale] Đang dịch {len(top40)} bài...")
     translated = await asyncio.get_event_loop().run_in_executor(None, _translate_batch, top40)
+
     for item in translated:
         if not item.get("image"):
             coins = item.get("coins",[])
             if coins: item["image"] = DEFAULT_COIN_IMAGES.get(coins[0],"")
-    print(f"[Whale] Dịch xong {len(translated)} bài.")
-    return {"status":"success","count":len(translated),
-            "updated_at":datetime.now(timezone.utc).isoformat(),"data":translated}
 
+    print(f"[Whale] Dịch xong {len(translated)} bài.")
+
+    return {
+        "status":"success",
+        "count":len(translated),
+        "updated_at":datetime.now(timezone.utc).isoformat(),
+        "data":translated
+    }
 # ══════════════════════════════════════════════════════════════════
 #  7. BACKGROUND WORKERS
 # ══════════════════════════════════════════════════════════════════
@@ -366,6 +411,15 @@ app = FastAPI(
     description="Real-time crypto · Analysis · On-chain · News · Auth",
     lifespan=lifespan,
 )
+if not firebase_admin._apps:
+    key_path = "serviceAccountKey.json" if os.path.exists("serviceAccountKey.json") else "api/serviceAccountKey.json"
+    cred = credentials.Certificate(key_path)
+    firebase_admin.initialize_app(cred)
+
+os.makedirs("static/avatars", exist_ok=True)
+os.makedirs("static/avatars", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/login")
@@ -389,6 +443,11 @@ class NewsPost(BaseModel):
     content:     str
     image_url:   str = ""
     category_id: int = 3
+class UserUpdate(BaseModel):
+    full_name: str
+    phone: str
+class GoogleFirebaseAuth(BaseModel):
+    id_token: str   # Firebase idToken từ Android
 
 # ══════════════════════════════════════════════════════════════════
 #  11. AUTH ENDPOINTS
@@ -504,8 +563,93 @@ async def login_user(user: UserLogin):
     finally:
         if cursor: cursor.close()
         if conn:   conn.close()
+GOOGLE_WEB_CLIENT_ID = os.getenv("GOOGLE_WEB_CLIENT_ID", "")
+@app.post("/api/v1/auth/google", tags=["Auth"])
+async def login_with_google(data: GoogleFirebaseAuth):
+    conn = cursor = None
+    try:
+        try:
+            client_id = os.getenv("GOOGLE_WEB_CLIENT_ID") 
+            idinfo = id_token.verify_oauth2_token(
+                data.id_token, 
+                requests.Request(), 
+                client_id,
+                clock_skew_in_seconds=60 
+            )
+            email = idinfo['email']
+            name  = idinfo.get('name', 'Người dùng CryptoPulse')
+            avatar = idinfo.get('picture', '')
+            
+        except Exception as auth_error:
+            print(f"--- [Google Auth Error] ---")
+            print(f"Chi tiết: {str(auth_error)}")
+            raise HTTPException(status_code=401, detail=str(auth_error))
 
+        # 2. Kết nối Database
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
 
+        # 3. Kiểm tra hoặc tạo User
+        cursor.execute("SELECT * FROM users WHERE email=%s", (email,))
+        user = cursor.fetchone()
+
+        if not user:
+            # Tạo tài khoản mới nếu chưa có
+            username = email.split("@")[0]
+            # Đảm bảo username không trùng
+            cursor.execute("SELECT id FROM users WHERE username=%s", (username,))
+            if cursor.fetchone():
+                username = f"{username}_{str(int(time.time()))[-4:]}"
+
+            # Mật khẩu ngẫu nhiên cho tài khoản Google
+            rand_pass = secrets.token_hex(16)
+            hashed_pass = hash_password(rand_pass)
+
+            cursor.execute(
+                """INSERT INTO users 
+                   (username, email, password_hash, full_name, role, status, avatar_url) 
+                   VALUES (%s, %s, %s, %s, 'user', 'active', %s)""",
+                (username, email, hashed_pass, name, avatar)
+            )
+            conn.commit()
+            cursor.execute("SELECT * FROM users WHERE id=%s", (cursor.lastrowid,))
+            user = cursor.fetchone()
+
+        # 4. Cập nhật last_login
+        cursor.execute("UPDATE users SET last_login=NOW() WHERE id=%s", (user["id"],))
+        conn.commit()
+
+        # 5. Tạo JWT nội bộ của CryptoPulse
+        access_token = create_token({
+            "sub": user["username"],
+            "email": user["email"],
+            "role": user["role"],
+        })
+        
+        return {
+            "status": "success",
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {
+                "id":         user["id"],
+                "username":   user["username"],
+                "email":      user["email"],
+                "full_name":  user.get("full_name", ""),
+                "role":       user["role"],
+                "avatar_url": user.get("avatar_url", ""),
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn: conn.rollback()
+        print(f"[System Error] {str(e)}")
+        raise HTTPException(status_code=500, detail="Lỗi hệ thống máy chủ nội bộ")
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+        
 # ── Đăng nhập Admin (OAuth2 form — dùng cho /docs) ───────────────
 @app.post("/api/v1/login", tags=["Auth"])
 async def login_admin(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -563,19 +707,100 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Token không hợp lệ.")
 
+# ── Cập nhật thông tin user (Tên, SĐT) ───────────────────────────
+@app.put("/api/v1/auth/me", tags=["Auth"])
+async def update_profile(data: UserUpdate, current_user: dict = Depends(get_current_user)):
+    """Cập nhật Tên hiển thị và Số điện thoại"""
+    conn = cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET full_name=%s, phone=%s WHERE username=%s",
+            (data.full_name, data.phone, current_user["username"])
+        )
+        conn.commit()
+        return {"status": "success", "message": "Cập nhật hồ sơ thành công!"}
+    except Exception as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
 
+# ── Upload ảnh đại diện (Avatar) ─────────────────────────────────
+@app.post("/api/v1/auth/avatar", tags=["Auth"])
+async def upload_avatar(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    """Upload ảnh đại diện lên server và lưu URL vào DB"""
+    # 1. Tạo tên file duy nhất tránh trùng lặp
+    ext = file.filename.split(".")[-1]
+    filename = f"{current_user['username']}_{int(time.time())}.{ext}"
+    file_path = f"static/avatars/{filename}"
+
+    # 2. Lưu file vào ổ cứng máy chủ
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # 3. Tạo URL để Android có thể load được
+    avatar_url = f"/{file_path}"
+
+    # 4. Lưu URL vào MySQL
+    conn = cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET avatar_url=%s WHERE username=%s",
+            (avatar_url, current_user["username"])
+        )
+        conn.commit()
+        return {
+            "status": "success", 
+            "message": "Cập nhật ảnh đại diện thành công!",
+            "avatar_url": avatar_url
+        }
+    except Exception as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+        
 # ── Dependency: chỉ admin ─────────────────────────────────────────
 def get_admin_user(current: dict = Depends(get_current_user)) -> dict:
     if current.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Không có quyền admin!")
     return current
-
+# ── Xóa ảnh đại diện (Quay về mặc định) ──────────────────────────
+@app.delete("/api/v1/auth/avatar", tags=["Auth"])
+async def delete_avatar(current_user: dict = Depends(get_current_user)):
+    conn = cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Xóa đường dẫn ảnh trong DB (set thành rỗng)
+        cursor.execute(
+            "UPDATE users SET avatar_url='' WHERE username=%s",
+            (current_user["username"],)
+        )
+        conn.commit()
+        return {"status": "success", "message": "Đã xóa ảnh đại diện!"}
+    except Exception as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+class GoogleAuth(BaseModel):
+    email: str
+    name: str
+    avatar: str = ""
 
 # ══════════════════════════════════════════════════════════════════
-#  12. ADMIN — QUẢN LÝ NGƯỜI DÙNG
+#  12. ADMIN — QUẢN LÝ NGƯỜI DÙNG (CLEAN VERSION)
 # ══════════════════════════════════════════════════════════════════
 
-# ── Danh sách tất cả thành viên ──────────────────────────────────
+# ── Danh sách tất cả thành viên (Đã xóa cột status) ──────────────
 @app.get("/api/v1/admin/users", tags=["Admin"])
 async def get_all_users(
     page:    int = Query(1,  ge=1),
@@ -583,31 +808,32 @@ async def get_all_users(
     search:  str = Query(""),
     admin:   dict = Depends(get_admin_user),
 ):
-    """Lấy danh sách thành viên. Hỗ trợ phân trang và tìm kiếm."""
+    """Lấy danh sách thành viên. Không còn hiển thị trạng thái banned."""
     conn = cursor = None
     try:
         conn   = get_db_connection()
         cursor = conn.cursor(dictionary=True)
         offset = (page - 1) * limit
 
+        # Chỉ SELECT những cột cần thiết, bỏ status
+        base_query = (
+            "SELECT id, username, email, full_name, phone, role, avatar_url, "
+            "created_at, last_login FROM users"
+        )
+
         if search:
             like = f"%{search}%"
             cursor.execute(
-                "SELECT id,username,email,full_name,phone,role,status,"
-                "created_at,last_login FROM users"
-                " WHERE username LIKE %s OR email LIKE %s OR full_name LIKE %s"
-                " ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                f"{base_query} WHERE username LIKE %s OR email LIKE %s OR full_name LIKE %s "
+                "ORDER BY created_at DESC LIMIT %s OFFSET %s",
                 (like, like, like, limit, offset))
         else:
             cursor.execute(
-                "SELECT id,username,email,full_name,phone,role,status,"
-                "created_at,last_login FROM users"
-                " ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                f"{base_query} ORDER BY created_at DESC LIMIT %s OFFSET %s",
                 (limit, offset))
 
         users = cursor.fetchall()
 
-        # Tổng số user
         cursor.execute("SELECT COUNT(*) AS total FROM users")
         total = cursor.fetchone()["total"]
 
@@ -616,7 +842,7 @@ async def get_all_users(
             "total":  total,
             "page":   page,
             "limit":  limit,
-            "data":   users,
+            "users":  users,  
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -625,7 +851,7 @@ async def get_all_users(
         if conn:   conn.close()
 
 
-# ── Chi tiết 1 user ──────────────────────────────────────────────
+# ── Chi tiết 1 user (Đã xóa status) ──────────────────────────────
 @app.get("/api/v1/admin/users/{user_id}", tags=["Admin"])
 async def get_user_detail(
     user_id: int,
@@ -636,8 +862,8 @@ async def get_user_detail(
         conn   = get_db_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            "SELECT id,username,email,full_name,phone,role,status,avatar_url,"
-            "created_at,last_login FROM users WHERE id=%s", (user_id,))
+            "SELECT id, username, email, full_name, phone, role, avatar_url, "
+            "created_at, last_login FROM users WHERE id=%s", (user_id,))
         user = cursor.fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="Không tìm thấy user.")
@@ -647,41 +873,10 @@ async def get_user_detail(
         if conn:   conn.close()
 
 
-# ── Khóa / Mở khóa tài khoản ─────────────────────────────────────
-@app.put("/api/v1/admin/users/{user_id}/status", tags=["Admin"])
-async def update_user_status(
-    user_id: int,
-    status:  str = Query(..., description="active | banned"),
-    admin:   dict = Depends(get_admin_user),
-):
-    if status not in ("active","banned"):
-        raise HTTPException(status_code=400, detail="Status phải là 'active' hoặc 'banned'")
-    conn = cursor = None
-    try:
-        conn   = get_db_connection()
-        cursor = conn.cursor()
-        # Không cho phép khóa tài khoản admin
-        cursor.execute(
-            "UPDATE users SET status=%s WHERE id=%s AND role!='admin'",
-            (status, user_id))
-        if cursor.rowcount == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Không thể thay đổi trạng thái tài khoản admin!")
-        conn.commit()
-        msg = "Đã mở khóa tài khoản!" if status == "active" else "Đã khóa tài khoản!"
-        return {"status":"success","message":msg}
-    except HTTPException:
-        raise
-    except Exception as e:
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if cursor: cursor.close()
-        if conn:   conn.close()
+# 🔥 ĐÃ XÓA: Endpoint update_user_status (/api/v1/admin/users/{user_id}/status)
 
 
-# ── Đổi role user ────────────────────────────────────────────────
+# ── Đổi role user (Giữ lại vì Admin vẫn cần phân quyền) ──────────
 @app.put("/api/v1/admin/users/{user_id}/role", tags=["Admin"])
 async def update_user_role(
     user_id: int,
@@ -705,7 +900,7 @@ async def update_user_role(
         if conn:   conn.close()
 
 
-# ── Xóa user ─────────────────────────────────────────────────────
+# ── Xóa user (Admin vẫn có quyền xóa vĩnh viễn) ──────────────────
 @app.delete("/api/v1/admin/users/{user_id}", tags=["Admin"])
 async def delete_user(
     user_id: int,
@@ -730,32 +925,28 @@ async def delete_user(
         if cursor: cursor.close()
         if conn:   conn.close()
 
-
-# ── Thống kê tổng quan (admin dashboard) ─────────────────────────
 @app.get("/api/v1/admin/stats", tags=["Admin"])
 async def get_admin_stats(admin: dict = Depends(get_admin_user)):
     conn = cursor = None
     try:
         conn   = get_db_connection()
         cursor = conn.cursor(dictionary=True)
+        
         cursor.execute("SELECT COUNT(*) AS total FROM users")
         total_users = cursor.fetchone()["total"]
-        cursor.execute("SELECT COUNT(*) AS total FROM users WHERE status='active'")
-        active_users = cursor.fetchone()["total"]
-        cursor.execute("SELECT COUNT(*) AS total FROM users WHERE status='banned'")
-        banned_users = cursor.fetchone()["total"]
-        cursor.execute("SELECT COUNT(*) AS total FROM news WHERE status='published'")
+        
+        cursor.execute("SELECT COUNT(*) AS total FROM news")
         total_news = cursor.fetchone()["total"]
+        
         cursor.execute(
             "SELECT COUNT(*) AS total FROM users"
             " WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)")
         new_users_week = cursor.fetchone()["total"]
+        
         return {
             "status": "success",
             "stats": {
                 "total_users":     total_users,
-                "active_users":    active_users,
-                "banned_users":    banned_users,
                 "new_users_week":  new_users_week,
                 "total_news":      total_news,
             }
@@ -765,8 +956,6 @@ async def get_admin_stats(admin: dict = Depends(get_admin_user)):
     finally:
         if cursor: cursor.close()
         if conn:   conn.close()
-
-
 # ══════════════════════════════════════════════════════════════════
 #  13. MARKET DATA
 # ══════════════════════════════════════════════════════════════════
@@ -1173,22 +1362,35 @@ async def get_wallet_txs(
 # ══════════════════════════════════════════════════════════════════
 #  18. NEWS ENDPOINTS
 # ══════════════════════════════════════════════════════════════════
+
+# ── Models ───────────────────────────────────────────────────────
+class HideNewsRequest(BaseModel):
+    url: str
+
+# ── Tin nội bộ đã duyệt ──────────────────────────────────────────
 @app.get("/api/v1/news", tags=["News"])
 async def get_all_news():
     conn = cursor = None
     try:
         conn   = get_db_connection()
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM news WHERE status='published' ORDER BY created_at DESC LIMIT 20")
-        return {"status":"success","data":cursor.fetchall()}
+        cursor.execute(
+            "SELECT * FROM news WHERE status='published'"
+            " ORDER BY created_at DESC LIMIT 20")
+        return {"status": "success", "data": cursor.fetchall()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if cursor: cursor.close()
         if conn:   conn.close()
 
+
+# ── Admin: Đăng tin nội bộ ───────────────────────────────────────
 @app.post("/api/v1/news/admin/post", tags=["News"])
-async def admin_post_news(news: NewsPost, admin: dict = Depends(get_admin_user)):
+async def admin_post_news(
+    news:  NewsPost,
+    admin: dict = Depends(get_admin_user),
+):
     conn = cursor = None
     try:
         conn   = get_db_connection()
@@ -1196,9 +1398,14 @@ async def admin_post_news(news: NewsPost, admin: dict = Depends(get_admin_user))
         cursor.execute(
             "INSERT INTO news(title,content,image_url,author,category_id,status)"
             " VALUES(%s,%s,%s,%s,%s,'published')",
-            (news.title,news.content,news.image_url,admin["username"],news.category_id))
+            (news.title, news.content, news.image_url,
+             admin["username"], news.category_id))
         conn.commit()
-        return {"status":"success","news_id":cursor.lastrowid,"message":"Đã đăng tin thành công!"}
+        return {
+            "status":  "success",
+            "news_id": cursor.lastrowid,
+            "message": "Đã đăng tin thành công!",
+        }
     except Exception as e:
         if conn: conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -1206,90 +1413,271 @@ async def admin_post_news(news: NewsPost, admin: dict = Depends(get_admin_user))
         if cursor: cursor.close()
         if conn:   conn.close()
 
+
+# ── Admin: Sửa tin nội bộ ────────────────────────────────────────
+@app.put("/api/v1/news/admin/{news_id}", tags=["News"])
+async def admin_update_news(
+    news_id: int,
+    news:    NewsPost,
+    admin:   dict = Depends(get_admin_user),
+):
+    conn = cursor = None
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM news WHERE id=%s", (news_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Không tìm thấy bài viết!")
+        cursor.execute(
+            "UPDATE news SET title=%s,content=%s,image_url=%s,category_id=%s"
+            " WHERE id=%s",
+            (news.title, news.content, news.image_url,
+             news.category_id, news_id))
+        conn.commit()
+        return {"status": "success", "message": f"Đã cập nhật bài viết #{news_id}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+# ── Admin: Xóa tin nội bộ (DB) ───────────────────────────────────
+@app.delete("/api/v1/news/admin/{news_id}", tags=["News"])
+async def admin_delete_news(
+    news_id: int,
+    admin:   dict = Depends(get_admin_user),
+):
+    conn = cursor = None
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM news WHERE id=%s", (news_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Không tìm thấy bài viết!")
+        conn.commit()
+        return {"status": "success", "message": "Đã xóa bài viết!"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+# ── Admin: Chặn vĩnh viễn tin Whale theo URL (Blacklist) ─────────
+@app.post("/api/v1/admin/news/hide", tags=["News"])
+async def hide_whale_news(
+    req:   HideNewsRequest,
+    admin: dict = Depends(get_admin_user),
+):
+    """
+    Thêm URL vào Danh sách đen Redis.
+    Bot có kéo lại bài này thì cũng không hiện lên app.
+    """
+    if not req.url or not req.url.startswith("http"):
+        raise HTTPException(status_code=400, detail="URL không hợp lệ!")
+    try:
+        await async_redis_client.sadd("hidden_whale_news", req.url)
+        return {
+            "status":  "success",
+            "message": "Đã chặn bài báo này vĩnh viễn!",
+            "url":     req.url,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Admin: Xem danh sách đen ─────────────────────────────────────
+@app.get("/api/v1/admin/news/hidden", tags=["News"])
+async def get_hidden_news(admin: dict = Depends(get_admin_user)):
+    """Xem tất cả URL đang bị chặn."""
+    try:
+        raw = await async_redis_client.smembers("hidden_whale_news")
+        urls = [u.decode("utf-8") if isinstance(u, bytes) else u
+                for u in (raw or [])]
+        return {"status": "success", "count": len(urls), "hidden_urls": urls}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Admin: Bỏ chặn một bài (xóa khỏi blacklist) ──────────────────
+@app.delete("/api/v1/admin/news/hidden", tags=["News"])
+async def unhide_whale_news(
+    req:   HideNewsRequest,
+    admin: dict = Depends(get_admin_user),
+):
+    """Khôi phục bài bị ẩn — xóa URL khỏi Danh sách đen."""
+    try:
+        removed = await async_redis_client.srem("hidden_whale_news", req.url)
+        if removed == 0:
+            raise HTTPException(
+                status_code=404, detail="URL này không có trong danh sách đen!")
+        return {"status": "success", "message": "Đã bỏ chặn bài báo này!"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Whale news (tích hợp bộ lọc Blacklist) ───────────────────────
 @app.get("/api/v1/news/whale", tags=["News"])
 async def get_whale_news(
     force_refresh: bool = Query(False),
     coin:          str  = Query(None),
     limit:         int  = Query(20, le=40),
 ):
+    """Tin Whale đã dịch tiếng Việt, tự động lọc bỏ URL trong Blacklist."""
     try:
         if force_refresh:
-            payload = await asyncio.wait_for(_build_whale_news_payload(), timeout=300)
-            await async_redis_client.setex("whale_institutional_news",900,
-                                           json.dumps(payload,ensure_ascii=False))
+            payload = await asyncio.wait_for(
+                _build_whale_news_payload(), timeout=300)
+            await async_redis_client.setex(
+                "whale_institutional_news", 900,
+                json.dumps(payload, ensure_ascii=False))
         else:
             cached  = await async_redis_client.get("whale_institutional_news")
-            payload = json.loads(cached) if cached else await _build_whale_news_payload()
+            payload = json.loads(cached) if cached \
+                      else await _build_whale_news_payload()
             if not cached:
-                await async_redis_client.setex("whale_institutional_news",900,
-                                               json.dumps(payload,ensure_ascii=False))
-        data = payload.get("data",[])
-        if coin: data = [n for n in data if coin.upper() in (n.get("coins") or [])]
-        return {"status":"success","count":len(data[:limit]),
-                "updated_at":payload.get("updated_at"),"filter_coin":coin,"data":data[:limit]}
+                await async_redis_client.setex(
+                    "whale_institutional_news", 900,
+                    json.dumps(payload, ensure_ascii=False))
+
+        data = payload.get("data", [])
+
+        # ── Lọc Blacklist ─────────────────────────────────────
+        raw_hidden = await async_redis_client.smembers("hidden_whale_news")
+        if raw_hidden:
+            blacklist = {
+                u.decode("utf-8") if isinstance(u, bytes) else u
+                for u in raw_hidden
+            }
+            data = [n for n in data if n.get("url") not in blacklist]
+
+        # ── Lọc theo coin ─────────────────────────────────────
+        if coin:
+            data = [n for n in data
+                    if coin.upper() in (n.get("coins") or [])]
+
+        return {
+            "status":      "success",
+            "count":       len(data[:limit]),
+            "updated_at":  payload.get("updated_at"),
+            "filter_coin": coin,
+            "data":        data[:limit],
+        }
     except asyncio.TimeoutError:
         raise HTTPException(status_code=503, detail="Đang xử lý, thử lại sau.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ── Thống kê coin trong Whale news ───────────────────────────────
 @app.get("/api/v1/news/whale/coins", tags=["News"])
 async def get_whale_news_coins():
     cached = await async_redis_client.get("whale_institutional_news")
-    if not cached: return {"status":"pending","message":"Chưa có dữ liệu..."}
-    payload = json.loads(cached)
+    if not cached:
+        return {"status": "pending", "message": "Chưa có dữ liệu..."}
+    payload    = json.loads(cached)
     coin_count = {}
-    for item in payload.get("data",[]):
+    for item in payload.get("data", []):
         for c in (item.get("coins") or []):
-            coin_count[c] = coin_count.get(c,0)+1
-    return {"status":"success","updated_at":payload.get("updated_at"),
-            "coins":[{"coin":k,"count":v} for k,v in
-                     sorted(coin_count.items(),key=lambda x:x[1],reverse=True)]}
+            coin_count[c] = coin_count.get(c, 0) + 1
+    return {
+        "status":     "success",
+        "updated_at": payload.get("updated_at"),
+        "coins": [{"coin": k, "count": v}
+                  for k, v in sorted(
+                      coin_count.items(),
+                      key=lambda x: x[1], reverse=True)],
+    }
 
+
+# ── Trigger crawl thủ công ────────────────────────────────────────
 @app.post("/api/v1/news/crawl", tags=["News"])
 async def trigger_crawl(admin: dict = Depends(get_admin_user)):
     asyncio.create_task(crawl_worker_once())
-    return {"status":"success","message":"Đang crawl & dịch, vui lòng chờ ~30 giây."}
+    return {"status": "success",
+            "message": "Đang crawl & dịch, vui lòng chờ ~30 giây."}
+
 
 async def crawl_worker_once():
+    """Crawl CoinDesk, dịch tiếng Việt, bỏ qua URL trong Blacklist."""
     try:
-        async with httpx.AsyncClient(timeout=15,headers={"User-Agent":"Mozilla/5.0"}) as client:
-            res = await client.get("https://www.coindesk.com/arc/outboundfeeds/rss/")
-        if res.status_code != 200: return
+        async with httpx.AsyncClient(
+            timeout=15, headers={"User-Agent": "Mozilla/5.0"}
+        ) as client:
+            res = await client.get(
+                "https://www.coindesk.com/arc/outboundfeeds/rss/")
+        if res.status_code != 200:
+            return
+
+        # Đọc blacklist trước khi insert
+        raw_hidden = await async_redis_client.smembers("hidden_whale_news")
+        blacklist  = {
+            u.decode("utf-8") if isinstance(u, bytes) else u
+            for u in (raw_hidden or [])
+        }
+
         feed = feedparser.parse(res.text)
         conn = cursor = None
         try:
-            conn = get_db_connection(); cursor = conn.cursor(dictionary=True)
+            conn   = get_db_connection()
+            cursor = conn.cursor(dictionary=True)
             inserted = 0
             for entry in feed.entries[:10]:
-                url = entry.get("link","")
-                if not url: continue
-                cursor.execute("SELECT id FROM news WHERE original_url=%s",(url,))
-                if cursor.fetchone(): continue
-                title_vi   = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda t=entry.get("title",""):   _translate_vi(t,200))
-                content_vi = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda c=entry.get("summary",""): _translate_vi(c,500))
-                image_url = ""
-                media = entry.get("media_content",[])
-                if media: image_url = media[0].get("url","")
-                if not image_url:
-                    thumb = entry.get("media_thumbnail",[])
-                    if thumb: image_url = thumb[0].get("url","")
+                url = entry.get("link", "")
+                if not url:
+                    continue
+                # Bỏ qua URL trong Blacklist
+                if url in blacklist:
+                    print(f"[Crawl] Bỏ qua URL bị chặn: {url[:60]}")
+                    continue
                 cursor.execute(
-                    "INSERT INTO news(title,content,image_url,original_url,author,status,category_id)"
+                    "SELECT id FROM news WHERE original_url=%s", (url,))
+                if cursor.fetchone():
+                    continue
+
+                title_vi   = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda t=entry.get("title", ""):
+                    _translate_vi(t, 200))
+                content_vi = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda c=entry.get("summary", ""):
+                    _translate_vi(c, 500))
+
+                image_url = ""
+                media = entry.get("media_content", [])
+                if media:
+                    image_url = media[0].get("url", "")
+                if not image_url:
+                    thumb = entry.get("media_thumbnail", [])
+                    if thumb:
+                        image_url = thumb[0].get("url", "")
+
+                cursor.execute(
+                    "INSERT INTO news"
+                    "(title,content,image_url,original_url,author,status,category_id)"
                     " VALUES(%s,%s,%s,%s,%s,'published',3)",
-                    (title_vi,content_vi,image_url,url,"Bot (CoinDesk)"))
+                    (title_vi, content_vi, image_url, url, "Bot (CoinDesk)"))
                 inserted += 1
                 await asyncio.sleep(0.5)
+
             conn.commit()
             print(f"[Crawl-Once] ✓ {inserted} bài mới.")
         except Exception as e:
-            if conn: conn.rollback(); print(f"[Crawl-Once] ❌ {e}")
+            if conn: conn.rollback()
+            print(f"[Crawl-Once] ❌ {e}")
         finally:
             if cursor: cursor.close()
             if conn:   conn.close()
     except Exception as e:
-        print(f"[Crawl-Once] {e}")
+        print(f"[Crawl-Once] ❌ {e}")
 
 # ══════════════════════════════════════════════════════════════════
 #  19. WEBSOCKET

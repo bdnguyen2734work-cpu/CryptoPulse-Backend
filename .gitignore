@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 checkpoints/
 *.log
+api/serviceAccountKey.json
+venv/
+api/.env
+.env

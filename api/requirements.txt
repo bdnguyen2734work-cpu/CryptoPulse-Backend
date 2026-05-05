@@ -12,6 +12,7 @@ websockets
 feedparser==6.0.11
 deep-translator==1.11.4
 python-multipart==0.0.9
-python-multipart
-passlib[bcrypt]
+passlib==1.7.4
+bcrypt==4.0.1
 python-jose[cryptography]
+firebase-admin==6.5.0
