@@ -21,8 +21,8 @@ import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
-from api.database import get_db_connection, async_redis_client
-from api.workers import start_all_workers
+from database import get_db_connection, async_redis_client
+from workers import start_all_workers
 
 from google.oauth2 import id_token
 from google.auth.transport import requests
