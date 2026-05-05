@@ -410,37 +410,38 @@ app = FastAPI(
     description="Real-time crypto · Analysis · On-chain · News · Auth",
     lifespan=lifespan,
 )
-import base64, tempfile, json as _json
 
+import base64, json as _json
+
+# Khởi tạo Firebase an toàn
 firebase_key_b64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_B64", "")
-if firebase_key_b64:
-    key_dict = _json.loads(base64.b64decode(firebase_key_b64).decode())
-    cred = credentials.Certificate(key_dict)
-else:
-    import base64, tempfile, json as _json
+try:
+    if firebase_key_b64:
+        key_dict = _json.loads(base64.b64decode(firebase_key_b64).decode())
+        cred = credentials.Certificate(key_dict)
+    else:
+        # fallback cho local dev
+        key_path = "serviceAccountKey.json" if os.path.exists("serviceAccountKey.json") \
+                   else "api/serviceAccountKey.json"
+        cred = credentials.Certificate(key_path)
 
-firebase_key_b64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_B64", "")
-if firebase_key_b64:
-    key_dict = _json.loads(base64.b64decode(firebase_key_b64).decode())
-    cred = credentials.Certificate(key_dict)
-else:
-    # fallback cho local dev
-    key_path = "serviceAccountKey.json" if os.path.exists("serviceAccountKey.json") \
-               else "api/serviceAccountKey.json"
-    cred = credentials.Certificate(key_path)
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred)
+except Exception as e:
+    print(f"LỖI KHỞI TẠO FIREBASE: {e}")
 
-if not firebase_admin._apps:
-    firebase_admin.initialize_app(cred)
-
-if not firebase_admin._apps:
-    firebase_admin.initialize_app(cred)
-
-os.makedirs("static/avatars", exist_ok=True)
+# Khởi tạo thư mục static
 os.makedirs("static/avatars", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# Cấu hình CORS và Auth
+app.add_middleware(
+    CORSMiddleware, 
+    allow_origins=["*"],
+    allow_credentials=True, 
+    allow_methods=["*"], 
+    allow_headers=["*"]
+)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/login")
 
 # ══════════════════════════════════════════════════════════════════
