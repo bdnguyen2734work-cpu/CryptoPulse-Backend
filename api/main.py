@@ -22,7 +22,7 @@ from firebase_admin import credentials, auth as firebase_auth
 from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
 from database import get_db_connection, async_redis_client
-from workers import start_all_workers
+from workers import start
 
 from google.oauth2 import id_token
 from google.auth.transport import requests
@@ -395,7 +395,7 @@ async def crawl_worker():
 # ══════════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    t1 = asyncio.create_task(start_all_workers())
+    t1 = asyncio.create_task(start()) 
     t2 = asyncio.create_task(whale_news_worker())
     t3 = asyncio.create_task(crawl_worker())
     yield
