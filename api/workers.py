@@ -2,323 +2,263 @@ try:
     from database import async_redis_client
 except ModuleNotFoundError:
     from api.database import async_redis_client
-import asyncio  
+
+import asyncio
 import httpx
-import json
-import websockets
 import math
+import websockets
+import hashlib
 from datetime import datetime, timezone
 
+try:
+    import orjson as json
+    def dumps(x): return json.dumps(x)
+    def loads(x): return json.loads(x)
+except:
+    import json
+    def dumps(x): return json.dumps(x).encode()
+    def loads(x): return json.loads(x)
+
+
 # ══════════════════════════════════════════════════════════════════
-#  CONFIG
+# CONFIG
 # ══════════════════════════════════════════════════════════════════
-TOP_COINS = [
-    "BTCUSDT",  "ETHUSDT",  "BNBUSDT",  "SOLUSDT",  "XRPUSDT",
-    "ADAUSDT",  "DOGEUSDT", "AVAXUSDT", "DOTUSDT",  "LINKUSDT",
-    "POLUSDT",  "UNIUSDT",  "ATOMUSDT", "LTCUSDT",  "NEARUSDT",
-    "APTUSDT",  "ARBUSDT",  "OPUSDT",   "INJUSDT",  "SUIUSDT",
-    "TRXUSDT",  "SHIBUSDT", "BCHUSDT",  "ICPUSDT",
+TRACKED_COINS = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
+    "ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","LINKUSDT",
+    "POLUSDT","UNIUSDT","ATOMUSDT","LTCUSDT","NEARUSDT",
+    "APTUSDT","ARBUSDT","OPUSDT","INJUSDT","SUIUSDT",
+    "TRXUSDT","SHIBUSDT","BCHUSDT","ICPUSDT",
 ]
 
-WS_COINS = [
-    "btcusdt", "ethusdt", "bnbusdt",  "solusdt",
-    "xrpusdt", "adausdt", "dogeusdt", "avaxusdt",
-]
-WS_URI = (
-    "wss://stream.binance.com:9443/ws/"
-    + "/".join(f"{s}@kline_1m" for s in WS_COINS)
-)
+NAME_MAP = {
+    "BTCUSDT":"Bitcoin","ETHUSDT":"Ethereum","BNBUSDT":"BNB",
+    "SOLUSDT":"Solana","XRPUSDT":"XRP","ADAUSDT":"Cardano",
+    "DOGEUSDT":"Dogecoin","AVAXUSDT":"Avalanche","DOTUSDT":"Polkadot",
+    "LINKUSDT":"Chainlink","POLUSDT":"Polygon","UNIUSDT":"Uniswap",
+    "ATOMUSDT":"Cosmos","LTCUSDT":"Litecoin","NEARUSDT":"NEAR",
+    "APTUSDT":"Aptos","ARBUSDT":"Arbitrum","OPUSDT":"Optimism",
+    "INJUSDT":"Injective","SUIUSDT":"Sui","TRXUSDT":"TRON",
+    "SHIBUSDT":"Shiba Inu","BCHUSDT":"Bitcoin Cash","ICPUSDT":"Internet Computer",
+}
+WS_STREAMS = "/".join(f"{s.lower()}@kline_1m" for s in TRACKED_COINS)
+WS_URI = f"wss://stream.binance.com:9443/stream?streams={WS_STREAMS}"
+
+LIVE_PRICE_FLUSH_INTERVAL = 15
+META_FETCH_INTERVAL = 3600
+
+_live_price_cache = {}
+_meta_cache = {}
+_last_hash = None
 
 
 # ══════════════════════════════════════════════════════════════════
-#  FEAR & GREED — tự tính theo thuật toán chuẩn
+# UTILS
 # ══════════════════════════════════════════════════════════════════
-async def calculate_fear_greed(client: httpx.AsyncClient) -> dict:
+def _std(data):
+    if len(data) < 2:
+        return 0.0
+    mean = sum(data) / len(data)
+    return math.sqrt(sum((x - mean) ** 2 for x in data) / (len(data) - 1))
+
+
+# ══════════════════════════════════════════════════════════════════
+# FEAR & GREED
+# ══════════════════════════════════════════════════════════════════
+async def calculate_fear_greed(client):
     scores = {}
 
-    # ── 1. BTC Price & Volatility (25%) ──────────────────────────
     try:
         resp = await client.get(
             "https://api.binance.com/api/v3/klines",
             params={"symbol": "BTCUSDT", "interval": "1d", "limit": 90}
         )
-        if resp.status_code == 200:
-            klines  = resp.json()
-            closes  = [float(k[4]) for k in klines]
-            returns = [
-                (closes[i] - closes[i-1]) / closes[i-1]
-                for i in range(1, len(closes))
-            ]
+        klines = resp.json()
+        closes = [float(k[4]) for k in klines]
 
-            # Volatility 30d vs 90d
-            vol_30 = _std(returns[-30:]) if len(returns) >= 30 else 0
-            vol_90 = _std(returns)       if len(returns) >= 60 else vol_30
+        returns = [(closes[i]-closes[i-1])/closes[i-1] for i in range(1,len(closes))]
 
-            if vol_90 > 0:
-                vol_ratio = vol_30 / vol_90
-                vol_score = max(0, min(100, int(100 - (vol_ratio - 0.5) * 80)))
-            else:
-                vol_score = 50
+        vol_30 = _std(returns[-30:])
+        vol_90 = _std(returns)
 
-            if len(closes) >= 30:
-                price_change_30d = (closes[-1] - closes[-30]) / closes[-30]
-                momentum_score   = max(0, min(100, int(50 + price_change_30d * 200)))
-            else:
-                momentum_score = 50
+        scores["volatility"] = int(100 - (vol_30/vol_90 - 0.5)*80) if vol_90 else 50
+        scores["momentum"] = int(50 + (closes[-1]-closes[-30])/closes[-30]*200)
 
-            scores["volatility"] = vol_score
-            scores["momentum"]   = momentum_score
+        volumes = [float(k[5]) for k in klines]
+        scores["volume"] = int((sum(volumes[-7:])/7)/(sum(volumes[-30:])/30)*50)
 
-            volumes  = [float(k[5]) for k in klines]
-            vol7d    = sum(volumes[-7:])  / 7  if len(volumes) >= 7  else 0
-            vol30d   = sum(volumes[-30:]) / 30 if len(volumes) >= 30 else vol7d
-            if vol30d > 0:
-                vol_momentum = vol7d / vol30d
-                scores["volume"] = max(0, min(100, int(vol_momentum * 50)))
-            else:
-                scores["volume"] = 50
+    except:
+        scores.update({"volatility":50,"momentum":50,"volume":50})
 
-    except Exception as e:
-        print(f"[F&G] BTC klines lỗi: {e}")
-        scores["volatility"] = 50
-        scores["momentum"]   = 50
-        scores["volume"]     = 50
-
-    # ── 2. BTC Dominance (10%) ────────────────────────────────────
     try:
         resp = await client.get("https://api.coingecko.com/api/v3/global")
-        if resp.status_code == 200:
-            d        = resp.json().get("data", {})
-            btc_dom  = float(d.get("market_cap_percentage", {}).get("btc", 50))
-            total_ch = float(d.get("market_cap_change_percentage_24h_usd", 0))
+        d = resp.json()["data"]
 
-            dom_score = max(0, min(100, int(100 - (btc_dom - 40) * 2)))
-            scores["dominance"] = dom_score
+        btc_dom = d["market_cap_percentage"]["btc"]
+        total_ch = d["market_cap_change_percentage_24h_usd"]
 
-            mktcap_score = max(0, min(100, int(50 + total_ch * 3)))
-            scores["market_cap"] = mktcap_score
+        scores["dominance"] = int(100-(btc_dom-40)*2)
+        scores["market_cap"] = int(50+total_ch*3)
+    except:
+        scores.update({"dominance":50,"market_cap":50})
 
-    except Exception as e:
-        print(f"[F&G] CoinGecko global lỗi: {e}")
-        scores["dominance"]  = 50
-        scores["market_cap"] = 50
-
-    # ── 3. Social / Trends approx (15%) ──────────────────────────
     try:
         resp = await client.get(
             "https://api.binance.com/api/v3/ticker/24hr",
-            params={"symbol": "BTCUSDT"}
+            params={"symbol":"BTCUSDT"}
         )
-        if resp.status_code == 200:
-            t        = resp.json()
-            pct_24h  = float(t.get("priceChangePercent", 0))
-            social_score = max(0, min(100, int(50 + pct_24h * 4)))
-            scores["social"] = social_score
-    except Exception as e:
-        print(f"[F&G] Social proxy lỗi: {e}")
+        pct = float(resp.json()["priceChangePercent"])
+        scores["social"] = int(50+pct*4)
+    except:
         scores["social"] = 50
 
     weights = {
-        "volatility": 0.25,
-        "momentum":   0.25,
-        "volume":     0.15,
-        "dominance":  0.10,
-        "market_cap": 0.15,
-        "social":     0.10,
+        "volatility":0.25,"momentum":0.25,"volume":0.15,
+        "dominance":0.10,"market_cap":0.15,"social":0.10
     }
-    final = sum(scores.get(k, 50) * w for k, w in weights.items())
-    final = max(0, min(100, int(round(final))))
 
-    if final >= 75:   label = "Extreme Greed"
-    elif final >= 56: label = "Greed"
-    elif final >= 45: label = "Neutral"
-    elif final >= 25: label = "Fear"
-    else:             label = "Extreme Fear"
+    final = int(sum(scores[k]*weights[k] for k in weights))
 
     return {
-        "value":          final,
-        "classification": label,
-        "source":         "self-calculated",
-        "components":     scores,
-        "timestamp":      int(datetime.now(timezone.utc).timestamp()),
-        "note": (
-            "Volatility 25% + Momentum 25% + Volume 15% + "
-            "Dominance 10% + MarketCap 15% + Social 10%"
-        ),
+        "value": final,
+        "classification":
+            "Extreme Greed" if final>=75 else
+            "Greed" if final>=56 else
+            "Neutral" if final>=45 else
+            "Fear" if final>=25 else "Extreme Fear",
+        "timestamp": int(datetime.now(timezone.utc).timestamp())
     }
 
 
-def _std(data: list) -> float:
-    if len(data) < 2:
-        return 0.0
-    n    = len(data)
-    mean = sum(data) / n
-    return math.sqrt(sum((x - mean) ** 2 for x in data) / (n - 1))
-
-
-# ══════════════════════════════════════════════════════════════════
-#  WORKER 1: FEAR & GREED
-# ══════════════════════════════════════════════════════════════════
 async def fetch_fear_and_greed():
     while True:
-        success = False
         try:
-            async with httpx.AsyncClient(
-                timeout=20,
-                headers={"User-Agent": "Mozilla/5.0"}
-            ) as client:
-                payload = await calculate_fear_greed(client)
+            async with httpx.AsyncClient(timeout=20) as client:
+                data = await calculate_fear_greed(client)
 
-            await async_redis_client.set(
-                "market_fear_greed", json.dumps(payload)
-            )
-            print(
-                f"[F&G] Tự tính → {payload['value']} "
-                f"({payload['classification']}) | "
-                f"components: {payload['components']}"
-            )
-            success = True
+            await async_redis_client.set("market_fear_greed", dumps(data))
+            print("[F&G]", data["value"], data["classification"])
 
         except Exception as e:
-            print(f"[F&G] Tự tính lỗi: {e}")
-
-        if not success:
-            try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    resp = await client.get(
-                        "https://api.alternative.me/fng/?limit=1&format=json"
-                    )
-                if resp.status_code == 200:
-                    item  = resp.json()["data"][0]
-                    value = int(item["value"])
-                    label = item["value_classification"]
-                    payload = {
-                        "value":          value,
-                        "classification": label,
-                        "source":         "alternative.me (fallback)",
-                        "timestamp":      int(item.get("timestamp", 0)),
-                    }
-                    await async_redis_client.set(
-                        "market_fear_greed", json.dumps(payload)
-                    )
-                    print(f"[F&G] Fallback alternative.me → {value} ({label})")
-            except Exception as e:
-                print(f"[F&G] Fallback lỗi: {e}")
+            print("[F&G] lỗi:", e)
 
         await asyncio.sleep(3600)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  WORKER 2: TOP 24 COINS (Sửa lỗi HTTP 400)
+# METADATA
 # ══════════════════════════════════════════════════════════════════
-async def fetch_top_coins():
-    base_url = "https://api.binance.com/api/v3/ticker/24hr"
-
-    name_map = {
-        "BTCUSDT": "Bitcoin",          "ETHUSDT": "Ethereum",
-        "BNBUSDT": "BNB",              "SOLUSDT": "Solana",
-        "XRPUSDT": "XRP",             "ADAUSDT": "Cardano",
-        "DOGEUSDT": "Dogecoin",        "AVAXUSDT": "Avalanche",
-        "DOTUSDT": "Polkadot",         "LINKUSDT": "Chainlink",
-        "POLUSDT": "Polygon",          "UNIUSDT": "Uniswap",
-        "ATOMUSDT": "Cosmos",          "LTCUSDT": "Litecoin",
-        "NEARUSDT": "NEAR",            "APTUSDT": "Aptos",
-        "ARBUSDT": "Arbitrum",         "OPUSDT": "Optimism",
-        "INJUSDT": "Injective",        "SUIUSDT": "Sui",
-        "TRXUSDT": "TRON",             "SHIBUSDT": "Shiba Inu",
-        "BCHUSDT": "Bitcoin Cash",     "ICPUSDT": "Internet Computer",
-    }
-
+async def fetch_coin_metadata():
     while True:
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                # SỬA QUAN TRỌNG: Thêm separators=(',', ':') để xóa khoảng trắng sau dấu phẩy
                 resp = await client.get(
-                    base_url, 
-                    params={"symbols": json.dumps(TOP_COINS, separators=(',', ':'))}
+                    "https://api.binance.com/api/v3/ticker/24hr",
+                    params={"symbols": dumps(TRACKED_COINS).decode()}
                 )
 
-            if resp.status_code == 200:
-                data = resp.json()
-                data.sort(
-                    key=lambda x: float(x.get("quoteVolume", 0)),
-                    reverse=True
-                )
-                for item in data:
-                    sym = item.get("symbol", "")
-                    item["coinName"]      = name_map.get(sym, sym.replace("USDT", ""))
-                    item["displaySymbol"] = "POL" if sym in ("MATICUSDT", "POLUSDT") \
-                                           else sym.replace("USDT", "")
+            raw = resp.json()
+            meta = {}
 
-                await async_redis_client.set(
-                    "top_20_coins_stats", json.dumps(data)
-                )
-                print(f"[Coins] Cập nhật {len(data)} coins ✓")
-            else:
-                print(f"[Coins] Binance HTTP {resp.status_code}: {resp.text}")
+            for item in raw:
+                sym = item["symbol"]
+                meta[sym] = {
+                    "coinName": NAME_MAP.get(sym, sym.replace("USDT","")),
+                    "priceChangePercent": float(item["priceChangePercent"]),
+                    "quoteVolume": float(item["quoteVolume"])
+                }
+
+            _meta_cache.clear()
+            _meta_cache.update(meta)
+
+            await async_redis_client.set("top_coins_meta", dumps(meta))
+            print("[Meta] updated")
 
         except Exception as e:
-            print(f"[Coins] Lỗi: {e}")
+            print("[Meta] lỗi:", e)
 
-        await asyncio.sleep(300)
+        await asyncio.sleep(META_FETCH_INTERVAL)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  WORKER 3: LIVE PRICE WebSocket
+# FLUSH
 # ══════════════════════════════════════════════════════════════════
-async def binance_live_price_worker():
-    retry_delay = 5
+async def _flush_live_prices():
+    global _last_hash
+
+    while True:
+        await asyncio.sleep(LIVE_PRICE_FLUSH_INTERVAL)
+
+        if not _live_price_cache:
+            continue
+
+        snapshot_live = dict(_live_price_cache)
+
+        snapshot = {}
+        for sym, live in snapshot_live.items():
+            entry = dict(live)
+            if sym in _meta_cache:
+                entry.update(_meta_cache[sym])
+            snapshot[sym] = entry
+
+        payload = dumps(snapshot)
+        new_hash = hashlib.md5(payload).hexdigest()
+
+        if new_hash == _last_hash:
+            continue
+
+        _last_hash = new_hash
+
+        try:
+            await async_redis_client.set("live_prices", payload)
+            print("[WS] flush", len(snapshot))
+        except Exception as e:
+            print("[WS] flush lỗi:", e)
+
+
+# ══════════════════════════════════════════════════════════════════
+# WEBSOCKET
+# ══════════════════════════════════════════════════════════════════
+async def binance_ws():
+    retry = 5
 
     while True:
         try:
-            async with websockets.connect(
-                WS_URI,
-                ping_interval=20,
-                ping_timeout=10,
-                close_timeout=5,
-            ) as ws:
-                print(f"[WS] Kết nối Binance WebSocket ✓ ({len(WS_COINS)} streams)")
-                retry_delay = 5
+            async with websockets.connect(WS_URI) as ws:
+                print("[WS] connected")
+                retry = 5
 
                 while True:
-                    raw  = await ws.recv()
-                    data = json.loads(raw)
-                    if "k" not in data:
+                    raw = await ws.recv()
+                    msg = loads(raw)
+                    if "data" in msg:
+                        msg = msg["data"]
+
+                    if "k" not in msg:
                         continue
 
-                    symbol = data["s"].upper()
-                    kline  = data["k"]
+                    k = msg["k"]
+                    sym = msg["s"]
 
-                    await async_redis_client.hset(
-                        f"kline:latest:{symbol}",
-                        mapping={
-                            "price":  str(float(kline["c"])),
-                            "open":   str(float(kline["o"])),
-                            "high":   str(float(kline["h"])),
-                            "low":    str(float(kline["l"])),
-                            "volume": str(float(kline["v"])),
-                            "time":   str(int(kline["t"])),
-                            "closed": str(kline["x"]),
-                        }
-                    )
+                    _live_price_cache[sym] = {
+                        "price": float(k["c"]),
+                        "time": int(k["t"])
+                    }
 
-        except websockets.exceptions.ConnectionClosed as e:
-            print(f"[WS] Mất kết nối: {e}. Reconnect sau {retry_delay}s...")
         except Exception as e:
-            print(f"[WS] Lỗi: {e}. Reconnect sau {retry_delay}s...")
+            print("[WS] lỗi:", e)
 
-        await asyncio.sleep(retry_delay)
-        retry_delay = min(retry_delay * 2, 60)
+        await asyncio.sleep(retry)
+        retry = min(retry*2, 60)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  KHỞI ĐỘNG
+# START
 # ══════════════════════════════════════════════════════════════════
-async def start_all_workers():
-    print("[Workers] Khởi động 3 workers...")
+async def start():
     await asyncio.gather(
         fetch_fear_and_greed(),
-        fetch_top_coins(),
-        binance_live_price_worker(),
-        return_exceptions=True,
+        fetch_coin_metadata(),
+        binance_ws(),
+        _flush_live_prices(),
     )
