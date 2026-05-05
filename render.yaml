@@ -10,4 +10,6 @@ services:
       - key: JWT_SECRET
         sync: false
       - key: FIREBASE_PROJECT_ID
+        sync: 
+      - key: REDIS_URL        
         sync: false
