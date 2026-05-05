@@ -151,19 +151,26 @@ async def fetch_fear_and_greed():
 async def fetch_coin_metadata():
     while True:
         try:
+            import json as _json  # dùng stdlib json cho params, tránh orjson bytes
+
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
                     "https://api.binance.com/api/v3/ticker/24hr",
-                    params={"symbols": dumps(TRACKED_COINS).decode()}
+                    params={"symbols": _json.dumps(TRACKED_COINS)}  # ← sửa chỗ này
                 )
 
             raw = resp.json()
-            meta = {}
 
+            # Kiểm tra Binance có trả về lỗi không
+            if isinstance(raw, dict):
+                print("[Meta] Binance lỗi:", raw)
+                raise ValueError(f"Unexpected response: {raw}")
+
+            meta = {}
             for item in raw:
                 sym = item["symbol"]
                 meta[sym] = {
-                    "coinName": NAME_MAP.get(sym, sym.replace("USDT","")),
+                    "coinName": NAME_MAP.get(sym, sym.replace("USDT", "")),
                     "priceChangePercent": float(item["priceChangePercent"]),
                     "quoteVolume": float(item["quoteVolume"])
                 }
@@ -172,7 +179,7 @@ async def fetch_coin_metadata():
             _meta_cache.update(meta)
 
             await async_redis_client.set("top_coins_meta", dumps(meta))
-            print("[Meta] updated")
+            print("[Meta] updated", len(meta), "coins")
 
         except Exception as e:
             print("[Meta] lỗi:", e)
