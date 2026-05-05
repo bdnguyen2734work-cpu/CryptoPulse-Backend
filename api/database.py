@@ -9,15 +9,14 @@ load_dotenv()
 # ══════════════════════════════════════════════
 # REDIS (Upstash dùng rediss:// — SSL tự động)
 # ══════════════════════════════════════════════
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-import ssl
+REDIS_URL = os.getenv("REDIS_URL")
+
+if not REDIS_URL:
+    raise ValueError("REDIS_URL is missing!")
 
 async_redis_client = redis.from_url(
     REDIS_URL,
-    decode_responses=True,
-    ssl_certfile=None,
-    ssl_keyfile=None,
-    ssl_cert_reqs=ssl.CERT_NONE if REDIS_URL.startswith("rediss://") else None,
+    decode_responses=True
 )
 
 # ══════════════════════════════════════════════
