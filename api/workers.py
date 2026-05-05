@@ -1,10 +1,13 @@
-import asyncio
+try:
+    from database import async_redis_client
+except ModuleNotFoundError:
+    from api.database import async_redis_client
+import asyncio  
 import httpx
 import json
 import websockets
 import math
 from datetime import datetime, timezone
-from database import async_redis_client
 
 # ══════════════════════════════════════════════════════════════════
 #  CONFIG
