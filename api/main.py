@@ -1,14 +1,8 @@
-<<<<<<< HEAD
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Path, Depends, File, UploadFile
-from fastapi.staticfiles import StaticFiles
-import shutil
-=======
 from fastapi import (
     FastAPI, HTTPException, Depends, Query, Path,
     WebSocket, WebSocketDisconnect
 )
 from fastapi.staticfiles import StaticFiles
->>>>>>> 0b956a89252890446fbfd957e6acd0a6a803aba2
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from contextlib import asynccontextmanager
@@ -27,17 +21,9 @@ import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
-<<<<<<< HEAD
-try:
-    from database import get_db_connection, async_redis_client
-    from workers import start_all_workers
-except ModuleNotFoundError:
-    from api.database import get_db_connection, async_redis_client
-    from api.workers import start_all_workers
-=======
 from database import get_db_connection, async_redis_client
 from workers import start_all_workers
->>>>>>> 0b956a89252890446fbfd957e6acd0a6a803aba2
+
 from google.oauth2 import id_token
 from google.auth.transport import requests
 # ══════════════════════════════════════════════════════════════════
@@ -424,11 +410,6 @@ app = FastAPI(
     description="Real-time crypto · Analysis · On-chain · News · Auth",
     lifespan=lifespan,
 )
-<<<<<<< HEAD
-if not firebase_admin._apps:
-    key_path = "serviceAccountKey.json" if os.path.exists("serviceAccountKey.json") else "api/serviceAccountKey.json"
-    cred = credentials.Certificate(key_path)
-=======
 import base64, tempfile, json as _json
 
 firebase_key_b64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_B64", "")
@@ -452,7 +433,6 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 
 if not firebase_admin._apps:
->>>>>>> 0b956a89252890446fbfd957e6acd0a6a803aba2
     firebase_admin.initialize_app(cred)
 
 os.makedirs("static/avatars", exist_ok=True)
@@ -768,24 +748,6 @@ async def update_profile(data: UserUpdate, current_user: dict = Depends(get_curr
         if conn:   conn.close()
 
 # ── Upload ảnh đại diện (Avatar) ─────────────────────────────────
-<<<<<<< HEAD
-@app.post("/api/v1/auth/avatar", tags=["Auth"])
-async def upload_avatar(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
-    """Upload ảnh đại diện lên server và lưu URL vào DB"""
-    # 1. Tạo tên file duy nhất tránh trùng lặp
-    ext = file.filename.split(".")[-1]
-    filename = f"{current_user['username']}_{int(time.time())}.{ext}"
-    file_path = f"static/avatars/{filename}"
-
-    # 2. Lưu file vào ổ cứng máy chủ
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # 3. Tạo URL để Android có thể load được
-    avatar_url = f"/{file_path}"
-
-    # 4. Lưu URL vào MySQL
-=======
 class AvatarUpdate(BaseModel):
     avatar_url: str
 
@@ -795,22 +757,12 @@ async def upload_avatar(
     current_user: dict = Depends(get_current_user)
 ):
     """Nhận Cloudinary URL từ Android và lưu vào DB"""
->>>>>>> 0b956a89252890446fbfd957e6acd0a6a803aba2
     conn = cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE users SET avatar_url=%s WHERE username=%s",
-<<<<<<< HEAD
-            (avatar_url, current_user["username"])
-        )
-        conn.commit()
-        return {
-            "status": "success", 
-            "message": "Cập nhật ảnh đại diện thành công!",
-            "avatar_url": avatar_url
-=======
             (data.avatar_url, current_user["username"])
         )
         conn.commit()
@@ -818,18 +770,13 @@ async def upload_avatar(
             "status": "success",
             "message": "Cập nhật ảnh đại diện thành công!",
             "avatar_url": data.avatar_url
->>>>>>> 0b956a89252890446fbfd957e6acd0a6a803aba2
         }
     except Exception as e:
         if conn: conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if cursor: cursor.close()
-<<<<<<< HEAD
-        if conn:   conn.close()
-=======
         if conn: conn.close()
->>>>>>> 0b956a89252890446fbfd957e6acd0a6a803aba2
         
 # ── Dependency: chỉ admin ─────────────────────────────────────────
 def get_admin_user(current: dict = Depends(get_current_user)) -> dict:
@@ -936,10 +883,6 @@ async def get_user_detail(
     finally:
         if cursor: cursor.close()
         if conn:   conn.close()
-
-
-# 🔥 ĐÃ XÓA: Endpoint update_user_status (/api/v1/admin/users/{user_id}/status)
-
 
 # ── Đổi role user (Giữ lại vì Admin vẫn cần phân quyền) ──────────
 @app.put("/api/v1/admin/users/{user_id}/role", tags=["Admin"])
