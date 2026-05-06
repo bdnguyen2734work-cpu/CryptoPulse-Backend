@@ -395,11 +395,16 @@ async def crawl_worker():
 # ══════════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    t1 = asyncio.create_task(start()) 
+    t1 = asyncio.create_task(start())
     t2 = asyncio.create_task(whale_news_worker())
     t3 = asyncio.create_task(crawl_worker())
+    
     yield
-    t1.cancel(); t2.cancel(); t3.cancel()
+    
+    for t in (t1, t2, t3):
+        t.cancel()
+    
+    await asyncio.gather(t1, t2, t3, return_exceptions=True)  
 
 # ══════════════════════════════════════════════════════════════════
 #  9. APP INIT

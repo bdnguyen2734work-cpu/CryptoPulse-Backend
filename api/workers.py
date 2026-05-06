@@ -44,7 +44,7 @@ NAME_MAP = {
 WS_STREAMS = "/".join(f"{s.lower()}@kline_1m" for s in TRACKED_COINS)
 WS_URI = f"wss://stream.binance.com:9443/stream?streams={WS_STREAMS}"
 
-LIVE_PRICE_FLUSH_INTERVAL = 15
+LIVE_PRICE_FLUSH_INTERVAL = 45
 META_FETCH_INTERVAL = 3600
 
 _live_price_cache = {}
@@ -151,12 +151,12 @@ async def fetch_fear_and_greed():
 async def fetch_coin_metadata():
     while True:
         try:
-            import json as _json  # dùng stdlib json cho params, tránh orjson bytes
+            import json as _json  
 
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
                     "https://api.binance.com/api/v3/ticker/24hr",
-                    params={"symbols": _json.dumps(TRACKED_COINS)}  # ← sửa chỗ này
+                    params={"symbols": _json.dumps(TRACKED_COINS)}  
                 )
 
             raw = resp.json()
