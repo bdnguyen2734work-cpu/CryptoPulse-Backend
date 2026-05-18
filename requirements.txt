@@ -11,3 +11,5 @@ plotly==5.20.0
 python-dotenv==1.0.1
 feedparser==6.0.11
 googletrans==4.0.0-rc1
+sqlalchemy==2.0.30
+pymysql==1.1.0
