@@ -1,65 +1,72 @@
 import os
-import socket
+from dotenv import load_dotenv
 
-# Hàm kiểm tra xem có đang chạy trong Docker hay không
-def is_docker():
-    return os.path.exists('/.dockerenv')
+load_dotenv()
 
+# ─────────────────────────────────────────
+# 1. Database (TiDB Cloud)
+# ─────────────────────────────────────────
 DB_CONFIG = {
-    # Nếu trong Docker thì host='mysql', nếu ở ngoài (VS Code) thì host='localhost'
-    "host": "mysql" if is_docker() else "localhost",
-    "user": "root",
-    "password": "rootpassword",
-    "database": "cryptopulse",
-    "port": 3306,
+    "host":     os.getenv("DB_HOST", "localhost"),
+    "port":     int(os.getenv("DB_PORT", 4000)),
+    "user":     os.getenv("DB_USER", "root"),
+    "password": os.getenv("DB_PASSWORD", ""),
+    "database": os.getenv("DB_NAME", "cryptopulse"),
+    # TiDB Cloud bắt buộc SSL
+    "ssl_verify_cert":     False,
+    "ssl_verify_identity": False,
 }
 
-# Chuỗi JDBC dùng cho Spark kết nối Database
 JDBC_URL    = f"jdbc:mysql://{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
 JDBC_DRIVER = "com.mysql.cj.jdbc.Driver"
 
 # ─────────────────────────────────────────
-# 2. Cấu hình Kafka (Truyền tải dữ liệu Real-time)
+# 2. Kafka
 # ─────────────────────────────────────────
-KAFKA_BOOTSTRAP  = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-KAFKA_TOPIC      = "market_tick_data"
-KAFKA_GROUP_ID   = "cryptopulse_group"
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_TOPIC     = "market_tick_data"
+KAFKA_GROUP_ID  = "cryptopulse_group"
 
 # ─────────────────────────────────────────
-# 3. Cấu hình Redis (Lưu trữ Cache & Live Price)
+# 3. Redis (Upstash)
 # ─────────────────────────────────────────
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
 REDIS_CONFIG = {
-    "host": os.getenv("REDIS_HOST", "redis"),
+    "host": os.getenv("REDIS_HOST", "localhost"),
     "port": int(os.getenv("REDIS_PORT", 6379)),
     "db":   0,
 }
 
 # ─────────────────────────────────────────
-# 4. Danh sách 25 Symbols chuẩn (Nguồn dữ liệu)
+# 4. Symbols
 # ─────────────────────────────────────────
 SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
     "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "SHIBUSDT", "DOTUSDT",
     "LINKUSDT", "TRXUSDT", "POLUSDT", "LTCUSDT", "BCHUSDT",
     "UNIUSDT", "NEARUSDT", "ATOMUSDT", "ICPUSDT", "APTUSDT",
-    "SUIUSDT", "INJUSDT",  "OPUSDT",  "ARBUSDT"]
+    "SUIUSDT", "INJUSDT",  "OPUSDT",  "ARBUSDT",
+]
 SYMBOLS_SET = set(SYMBOLS)
 
-# Cấu hình khung thời gian cho Spark Streaming
+# ─────────────────────────────────────────
+# 5. Timeframes
+# ─────────────────────────────────────────
 TIMEFRAMES = {
     "1m":  "1 minute",
     "5m":  "5 minutes",
     "15m": "15 minutes",
     "1h":  "1 hour",
+    "4h":  "4 hours",
     "1d":  "1 day",
     "1w":  "7 days",
 }
 
-# Số ngày tối đa để cào dữ liệu lịch sử (Backfill)
-BACKFILL_SHORT_DAYS = 30
+BACKFILL_SHORT_DAYS = int(os.getenv("BACKFILL_SHORT_DAYS", 30))
 
 # ─────────────────────────────────────────
-# 5. Cấu hình Spark
+# 6. Spark
 # ─────────────────────────────────────────
 SPARK_CHECKPOINT_DIR = os.getenv(
     "SPARK_CHECKPOINT_DIR",
@@ -67,7 +74,7 @@ SPARK_CHECKPOINT_DIR = os.getenv(
 )
 
 # ─────────────────────────────────────────
-# 6. Mapping cho App Android (Hiển thị Tên & Mã)
+# 7. Coin map (Android app)
 # ─────────────────────────────────────────
 APP_COIN_MAP = {
     "BTCUSDT":  {"name": "Bitcoin",           "symbol": "BTC"},

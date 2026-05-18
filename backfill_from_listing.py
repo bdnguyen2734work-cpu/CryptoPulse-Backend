@@ -1,9 +1,3 @@
-"""
-backfill_from_listing.py – Tải toàn bộ lịch sử 1D & 1W từ ngày niêm yết.
-
-Chạy 1 lần trước khi khởi động pipeline.
-"""
-
 import requests
 import time
 from datetime import datetime
@@ -51,7 +45,7 @@ def fetch_genesis_klines(symbol: str, tf: str):
 
             with get_db() as (conn, cursor):
                 cursor.executemany(f"""
-                    INSERT IGNORE INTO cryptopulse.{table_name}
+                    INSERT IGNORE INTO {table_name}
                         (symbol, open_time, open_price, high_price,
                          low_price, close_price, volume)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)

@@ -1,22 +1,20 @@
 """
 dashboard.py – Streamlit analytics dashboard cho CryptoPulse.
-
-Cải tiến:
-  • Dùng config.py, không hardcode
-  • Cache connection pool (st.cache_resource)
-  • Tính RSI + MACD → khớp với MarketFragment / AnalysisFragment trong app
-  • Layout 2 cột giống app Android
-  • Auto-rerun 5s (thay vì 2s để giảm tải DB)
+Kết nối TiDB Cloud qua SQLAlchemy + PyMySQL (không warning).
 """
 
+import os
 import time
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import mysql.connector
+from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
 
-from config import DB_CONFIG, SYMBOLS, APP_COIN_MAP
+from config import SYMBOLS, APP_COIN_MAP
+
+load_dotenv()
 
 # ─────────────────────────────────────────
 # Cấu hình trang
@@ -28,33 +26,41 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────
-# Connection (cache toàn session)
+# SQLAlchemy Engine (TiDB Cloud)
 # ─────────────────────────────────────────
 @st.cache_resource
-def get_pool():
-    """Tạo 1 connection duy nhất, tái sử dụng qua các rerun."""
-    return mysql.connector.connect(**DB_CONFIG)
+def get_engine():
+    host     = os.getenv("DB_HOST", "localhost")
+    port     = os.getenv("DB_PORT", "4000")
+    user     = os.getenv("DB_USER", "root")
+    password = os.getenv("DB_PASSWORD", "")
+    database = os.getenv("DB_NAME", "cryptopulse")
+
+    url = (
+        f"mysql+pymysql://{user}:{password}"
+        f"@{host}:{port}/{database}"
+        f"?ssl_verify_cert=false&ssl_verify_identity=false"
+    )
+    return create_engine(url, pool_size=3, pool_recycle=1800, pool_pre_ping=True)
 
 
 def query_df(sql: str) -> pd.DataFrame:
     try:
-        conn = get_pool()
-        if not conn.is_connected():
-            conn.reconnect(attempts=3, delay=1)
-        return pd.read_sql(sql, conn)
+        with get_engine().connect() as conn:
+            return pd.read_sql(text(sql), conn)
     except Exception as exc:
         st.error(f"DB Error: {exc}")
         return pd.DataFrame()
 
 
 # ─────────────────────────────────────────
-# Tính chỉ số kỹ thuật (khớp MarketFragment)
+# Chỉ số kỹ thuật
 # ─────────────────────────────────────────
 def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta  = series.diff()
-    gain   = delta.clip(lower=0).rolling(period).mean()
-    loss   = (-delta.clip(upper=0)).rolling(period).mean()
-    rs     = gain / loss.replace(0, 1e-9)
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, 1e-9)
     return 100 - (100 / (1 + rs))
 
 
@@ -85,55 +91,72 @@ def get_history(symbol: str, tf: str, limit: int = 500) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────
-# UI
+# UI Header
 # ─────────────────────────────────────────
 st.markdown(
     "<h1 style='text-align:center;color:#A9FFAC;'>🛡️ CryptoPulse Professional</h1>",
     unsafe_allow_html=True,
 )
 st.markdown(
-    "<p style='text-align:center;color:#767576;'>Big Data · Real-time Streaming · Obsidian Terminal</p>",
+    "<p style='text-align:center;color:#767576;'>"
+    "Big Data · Real-time Streaming · Obsidian Terminal"
+    "</p>",
     unsafe_allow_html=True,
 )
 
+# ─────────────────────────────────────────
 # Sidebar
+# ─────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Điều khiển")
-    selected_symbol = st.selectbox("🔍 Coin:", SYMBOLS,
-                                   index=SYMBOLS.index("BTCUSDT"))
-    selected_tf     = st.radio("⏰ Timeframe:",
-                               ["1m", "5m", "15m", "1h", "1d", "1w"],
-                               index=3, horizontal=True)
+    selected_symbol = st.selectbox(
+        "🔍 Coin:", SYMBOLS,
+        index=SYMBOLS.index("BTCUSDT"),
+    )
+    selected_tf = st.radio(
+        "⏰ Timeframe:",
+        ["1m", "5m", "15m", "1h", "4h", "1d", "1w"],
+        index=3,
+        horizontal=True,
+    )
     st.markdown("---")
     st.caption("App Android: CryptoPulse Obsidian")
 
-# Display name
-coin_info = APP_COIN_MAP.get(selected_symbol, {"name": selected_symbol, "symbol": selected_symbol})
+coin_info = APP_COIN_MAP.get(
+    selected_symbol,
+    {"name": selected_symbol, "symbol": selected_symbol},
+)
 
 # ─────────────────────────────────────────
-# Main content
+# Load dữ liệu
 # ─────────────────────────────────────────
 df = get_history(selected_symbol, selected_tf)
 
 if df.empty:
-    st.warning(f"⏳ Chưa có dữ liệu `{selected_symbol}` [{selected_tf}]. "
-               "Chạy backfill hoặc đợi Spark xử lý.")
+    st.warning(
+        f"⏳ Chưa có dữ liệu `{selected_symbol}` [{selected_tf}]. "
+        "Chạy backfill hoặc đợi Spark xử lý."
+    )
     time.sleep(5)
     st.rerun()
 
-latest = df.iloc[-1]
-prev   = df.iloc[-2] if len(df) > 1 else latest
+latest     = df.iloc[-1]
+prev       = df.iloc[-2] if len(df) > 1 else latest
 change_pct = (latest["close_price"] - prev["close_price"]) / prev["close_price"] * 100
 
-# ── Metrics row (khớp HomeFragment stats) ──
+# ─────────────────────────────────────────
+# Metrics row
+# ─────────────────────────────────────────
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("💰 Giá",        f"${latest['close_price']:,.4f}",  f"{change_pct:+.2f}%")
-c2.metric("📈 24H High",   f"${df['high_price'].max():,.4f}")
-c3.metric("📉 24H Low",    f"${df['low_price'].min():,.4f}")
-c4.metric("📊 Volume",     f"{latest['volume']:,.0f}")
-c5.metric("🕯️ Nến",       f"{len(df):,}")
+c1.metric("💰 Giá",      f"${latest['close_price']:,.4f}", f"{change_pct:+.2f}%")
+c2.metric("📈 24H High", f"${df['high_price'].max():,.4f}")
+c3.metric("📉 24H Low",  f"${df['low_price'].min():,.4f}")
+c4.metric("📊 Volume",   f"{latest['volume']:,.0f}")
+c5.metric("🕯️ Nến",     f"{len(df):,}")
 
-# ── Candlestick + Volume chart ──
+# ─────────────────────────────────────────
+# Candlestick + Volume + RSI chart
+# ─────────────────────────────────────────
 fig = make_subplots(
     rows=3, cols=1,
     shared_xaxes=True,
@@ -144,8 +167,10 @@ fig = make_subplots(
 
 fig.add_trace(go.Candlestick(
     x=df["open_time"],
-    open=df["open_price"], high=df["high_price"],
-    low=df["low_price"],   close=df["close_price"],
+    open=df["open_price"],
+    high=df["high_price"],
+    low=df["low_price"],
+    close=df["close_price"],
     name="Giá",
     increasing_line_color="#A9FFAC",
     decreasing_line_color="#FF7162",
@@ -156,15 +181,19 @@ vol_colors = [
     for c, o in zip(df["close_price"], df["open_price"])
 ]
 fig.add_trace(go.Bar(
-    x=df["open_time"], y=df["volume"],
-    marker_color=vol_colors, opacity=0.7, name="Volume",
+    x=df["open_time"],
+    y=df["volume"],
+    marker_color=vol_colors,
+    opacity=0.7,
+    name="Volume",
 ), row=2, col=1)
 
-# RSI (khớp MarketFragment indicators)
 rsi = calc_rsi(df["close_price"])
 fig.add_trace(go.Scatter(
-    x=df["open_time"], y=rsi,
-    line=dict(color="#A68CFF", width=1.5), name="RSI",
+    x=df["open_time"],
+    y=rsi,
+    line=dict(color="#A68CFF", width=1.5),
+    name="RSI",
 ), row=3, col=1)
 fig.add_hline(y=70, line_dash="dot", line_color="#FF7162", row=3, col=1)
 fig.add_hline(y=30, line_dash="dot", line_color="#A9FFAC", row=3, col=1)
@@ -181,10 +210,15 @@ fig.update_layout(
 )
 fig.update_yaxes(gridcolor="#1A191B")
 
-st.plotly_chart(fig, use_container_width=True,
-                key=f"chart_{selected_symbol}_{selected_tf}_{int(time.time()//5)}")
+st.plotly_chart(
+    fig,
+    use_container_width=True,
+    key=f"chart_{selected_symbol}_{selected_tf}_{int(time.time()//5)}",
+)
 
-# ── MACD + Indicators (khớp AnalysisFragment) ──
+# ─────────────────────────────────────────
+# MACD + Indicators
+# ─────────────────────────────────────────
 st.markdown("---")
 col_macd, col_gauge = st.columns([2, 1])
 
@@ -195,31 +229,41 @@ with col_macd:
 
     fig_macd = go.Figure()
     fig_macd.add_trace(go.Bar(
-        x=df["open_time"], y=histogram,
+        x=df["open_time"],
+        y=histogram,
         marker_color=["#A9FFAC" if v >= 0 else "#FF7162" for v in histogram],
         name="Histogram",
     ))
     fig_macd.add_trace(go.Scatter(
-        x=df["open_time"], y=macd_line,
-        line=dict(color="#A9FFAC", width=1.5), name="MACD",
+        x=df["open_time"],
+        y=macd_line,
+        line=dict(color="#A9FFAC", width=1.5),
+        name="MACD",
     ))
     fig_macd.add_trace(go.Scatter(
-        x=df["open_time"], y=signal_line,
-        line=dict(color="#FF7162", width=1.5), name="Signal",
+        x=df["open_time"],
+        y=signal_line,
+        line=dict(color="#FF7162", width=1.5),
+        name="Signal",
     ))
     fig_macd.update_layout(
         template="plotly_dark",
-        plot_bgcolor="#0E0E0F", paper_bgcolor="#0E0E0F",
-        height=250, margin=dict(l=5, r=5, t=10, b=5),
+        plot_bgcolor="#0E0E0F",
+        paper_bgcolor="#0E0E0F",
+        height=250,
+        margin=dict(l=5, r=5, t=10, b=5),
         showlegend=True,
         font=dict(color="#ADAAAB"),
     )
-    st.plotly_chart(fig_macd, use_container_width=True,
-                    key=f"macd_{selected_symbol}_{selected_tf}")
+    st.plotly_chart(
+        fig_macd,
+        use_container_width=True,
+        key=f"macd_{selected_symbol}_{selected_tf}",
+    )
 
 with col_gauge:
     st.subheader("🎯 Indicators")
-    rsi_val = rsi.iloc[-1] if not rsi.isna().all() else 50
+    rsi_val  = rsi.iloc[-1] if not rsi.isna().all() else 50
     macd_val = macd_line.iloc[-1]
     sig_val  = signal_line.iloc[-1]
 
@@ -237,6 +281,8 @@ with col_gauge:
     st.metric("Support",     f"${df['low_price'].tail(20).min():,.2f}")
     st.metric("Resistance",  f"${df['high_price'].tail(20).max():,.2f}")
 
+# ─────────────────────────────────────────
 # Auto-refresh 5s
+# ─────────────────────────────────────────
 time.sleep(5)
 st.rerun()

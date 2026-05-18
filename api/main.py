@@ -23,9 +23,25 @@ from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
 from database import get_db_connection, async_redis_client
 from workers import start
-
+from sqlalchemy import create_engine as _create_engine
 from google.oauth2 import id_token
 from google.auth.transport import requests
+
+def _get_analysis_engine():
+    import os
+    h = os.getenv("DB_HOST","localhost")
+    p = os.getenv("DB_PORT","4000")
+    u = os.getenv("DB_USER","root")
+    pw = os.getenv("DB_PASSWORD","")
+    db = os.getenv("DB_NAME","cryptopulse")
+    return _create_engine(
+        f"mysql+pymysql://{u}:{pw}@{h}:{p}/{db}"
+        f"?ssl_verify_cert=false&ssl_verify_identity=false",
+        pool_size=2, pool_recycle=1800
+    )
+
+_analysis_engine = _get_analysis_engine()
+
 # ══════════════════════════════════════════════════════════════════
 #  1. CẤU HÌNH
 # ══════════════════════════════════════════════════════════════════
@@ -988,7 +1004,7 @@ async def get_fear_greed():
 # ══════════════════════════════════════════════════════════════════
 #  14. KLINE HISTORY
 # ══════════════════════════════════════════════════════════════════
-VALID_TF = {"1m","5m","15m","1h","1d","1w"}
+VALID_TF = {"1m","5m","15m","1h","4h","1d","1w"}
 
 @app.get("/api/v1/history/{symbol}", tags=["Klines"])
 async def get_kline_history(
@@ -1041,17 +1057,21 @@ async def get_market_trend(symbol: str = Path(...), tf: str = Query("1d")):
             fng_value = fng_obj.get("value", 50)
             fng_label = fng_obj.get("classification", "Neutral")
 
-        conn = get_db_connection()
+        from sqlalchemy import text as _text
         try:
-            df = pd.read_sql(
-                f"SELECT open_price AS open, high_price AS high, low_price AS low,"
-                f" close_price AS close, volume FROM kline_{db_tf}"
-                f" WHERE symbol=%s ORDER BY open_time DESC LIMIT 100",
-                conn, params=(symbol,))
+            with _analysis_engine.connect() as _conn:
+                df = pd.read_sql(
+                    _text(
+                        f"SELECT open_price AS open, high_price AS high,"
+                        f" low_price AS low, close_price AS close, volume"
+                        f" FROM kline_{db_tf} WHERE symbol=:sym"
+                        f" ORDER BY open_time DESC LIMIT 100"
+                    ),
+                    _conn,
+                    params={"sym": symbol}
+                )
         except Exception as e:
-            conn.close()
             raise HTTPException(status_code=404, detail=str(e))
-        conn.close()
 
         if len(df) < 20:
             raise HTTPException(status_code=404, detail="Không đủ dữ liệu.")

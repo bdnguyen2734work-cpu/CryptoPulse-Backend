@@ -5,11 +5,19 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: MONGODB_URI
+      - key: MYSQL_HOST
         sync: false
-      - key: JWT_SECRET
+      - key: MYSQL_ROOT_PASSWORD
+        sync: false
+      - key: REDIS_HOST
+        sync: false
+      - key: REDIS_PORT
+        value: "6379"
+      - key: REDIS_URL
+        sync: false
+      - key: KAFKA_BOOTSTRAP_SERVERS
         sync: false
       - key: FIREBASE_PROJECT_ID
-        sync: 
-      - key: REDIS_URL        
+        sync: false
+      - key: JWT_SECRET
         sync: false
