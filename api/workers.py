@@ -1,3 +1,11 @@
+"""
+workers.py – Background workers cho CryptoPulse.
+  • Binance WebSocket → live price cache
+  • Fear & Greed Index (tự tính từ Binance + CoinGecko)
+  • Metadata 24h (change%, volume)
+  • Flush Redis mỗi 45s → top_24_coins_stats + live_prices
+"""
+
 try:
     from database import async_redis_client
 except ModuleNotFoundError:
@@ -6,263 +14,327 @@ except ModuleNotFoundError:
 import asyncio
 import httpx
 import math
-import websockets
 import hashlib
+import websockets
 from datetime import datetime, timezone
 
 try:
-    import orjson as json
-    def dumps(x): return json.dumps(x)
-    def loads(x): return json.loads(x)
-except:
-    import json
-    def dumps(x): return json.dumps(x).encode()
-    def loads(x): return json.loads(x)
+    import orjson as _json
+    def dumps(x): return _json.dumps(x)
+    def loads(x): return _json.loads(x)
+except ImportError:
+    import json as _json
+    def dumps(x): return _json.dumps(x, ensure_ascii=False).encode()
+    def loads(x): return _json.loads(x)
 
 
 # ══════════════════════════════════════════════════════════════════
-# CONFIG
+# CONFIG — 24 COINS
 # ══════════════════════════════════════════════════════════════════
 TRACKED_COINS = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-    "ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","LINKUSDT",
-    "POLUSDT","UNIUSDT","ATOMUSDT","LTCUSDT","NEARUSDT",
-    "APTUSDT","ARBUSDT","OPUSDT","INJUSDT","SUIUSDT",
-    "TRXUSDT","SHIBUSDT","BCHUSDT","ICPUSDT",
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "SHIBUSDT", "DOTUSDT",
+    "LINKUSDT", "TRXUSDT", "POLUSDT", "LTCUSDT", "BCHUSDT",
+    "UNIUSDT", "NEARUSDT", "ATOMUSDT", "ICPUSDT", "APTUSDT",
+    "SUIUSDT", "INJUSDT", "OPUSDT", "ARBUSDT",
 ]
 
 NAME_MAP = {
-    "BTCUSDT":"Bitcoin","ETHUSDT":"Ethereum","BNBUSDT":"BNB",
-    "SOLUSDT":"Solana","XRPUSDT":"XRP","ADAUSDT":"Cardano",
-    "DOGEUSDT":"Dogecoin","AVAXUSDT":"Avalanche","DOTUSDT":"Polkadot",
-    "LINKUSDT":"Chainlink","POLUSDT":"Polygon","UNIUSDT":"Uniswap",
-    "ATOMUSDT":"Cosmos","LTCUSDT":"Litecoin","NEARUSDT":"NEAR",
-    "APTUSDT":"Aptos","ARBUSDT":"Arbitrum","OPUSDT":"Optimism",
-    "INJUSDT":"Injective","SUIUSDT":"Sui","TRXUSDT":"TRON",
-    "SHIBUSDT":"Shiba Inu","BCHUSDT":"Bitcoin Cash","ICPUSDT":"Internet Computer",
+    "BTCUSDT":  "Bitcoin",
+    "ETHUSDT":  "Ethereum",
+    "BNBUSDT":  "BNB",
+    "SOLUSDT":  "Solana",
+    "XRPUSDT":  "XRP",
+    "ADAUSDT":  "Cardano",
+    "DOGEUSDT": "Dogecoin",
+    "AVAXUSDT": "Avalanche",
+    "SHIBUSDT": "Shiba Inu",
+    "DOTUSDT":  "Polkadot",
+    "LINKUSDT": "Chainlink",
+    "TRXUSDT":  "TRON",
+    "POLUSDT":  "Polygon",
+    "LTCUSDT":  "Litecoin",
+    "BCHUSDT":  "Bitcoin Cash",
+    "UNIUSDT":  "Uniswap",
+    "NEARUSDT": "NEAR",
+    "ATOMUSDT": "Cosmos",
+    "ICPUSDT":  "Internet Computer",
+    "APTUSDT":  "Aptos",
+    "SUIUSDT":  "Sui",
+    "INJUSDT":  "Injective",
+    "OPUSDT":   "Optimism",
+    "ARBUSDT":  "Arbitrum",
 }
+
+SYMBOL_MAP = {s: s.replace("USDT", "") for s in TRACKED_COINS}
+
 WS_STREAMS = "/".join(f"{s.lower()}@kline_1m" for s in TRACKED_COINS)
-WS_URI = f"wss://stream.binance.com:9443/stream?streams={WS_STREAMS}"
+WS_URI     = f"wss://stream.binance.com:9443/stream?streams={WS_STREAMS}"
 
-LIVE_PRICE_FLUSH_INTERVAL = 45
-META_FETCH_INTERVAL = 3600
+FLUSH_INTERVAL     = 45    # giây — flush Redis
+META_INTERVAL      = 3600  # giây — refresh metadata
+FNG_INTERVAL       = 3600  # giây — refresh Fear & Greed
 
-_live_price_cache = {}
-_meta_cache = {}
-_last_hash = None
+# Redis keys — đồng bộ với main.py
+REDIS_KEY_TOP_COINS  = "top_20_coins_stats"   # app Android đọc key này
+REDIS_KEY_LIVE       = "live_prices"           # internal
+REDIS_KEY_FNG        = "market_fear_greed"
+REDIS_KEY_META       = "top_coins_meta"
+
+# In-memory cache
+_live_price_cache: dict = {}
+_meta_cache:       dict = {}
+_last_hash:        str  = ""
 
 
 # ══════════════════════════════════════════════════════════════════
 # UTILS
 # ══════════════════════════════════════════════════════════════════
-def _std(data):
+def _std(data: list) -> float:
     if len(data) < 2:
         return 0.0
     mean = sum(data) / len(data)
     return math.sqrt(sum((x - mean) ** 2 for x in data) / (len(data) - 1))
 
 
+def _clamp(val: int, lo: int = 0, hi: int = 100) -> int:
+    return max(lo, min(hi, val))
+
+
 # ══════════════════════════════════════════════════════════════════
 # FEAR & GREED
 # ══════════════════════════════════════════════════════════════════
-async def calculate_fear_greed(client):
+async def _calculate_fear_greed(client: httpx.AsyncClient) -> dict:
     scores = {}
 
+    # 1. Volatility + Momentum + Volume (Binance BTC 90 ngày)
     try:
         resp = await client.get(
             "https://api.binance.com/api/v3/klines",
-            params={"symbol": "BTCUSDT", "interval": "1d", "limit": 90}
+            params={"symbol": "BTCUSDT", "interval": "1d", "limit": 90},
         )
-        klines = resp.json()
-        closes = [float(k[4]) for k in klines]
-
-        returns = [(closes[i]-closes[i-1])/closes[i-1] for i in range(1,len(closes))]
-
-        vol_30 = _std(returns[-30:])
-        vol_90 = _std(returns)
-
-        scores["volatility"] = int(100 - (vol_30/vol_90 - 0.5)*80) if vol_90 else 50
-        scores["momentum"] = int(50 + (closes[-1]-closes[-30])/closes[-30]*200)
-
+        klines  = resp.json()
+        closes  = [float(k[4]) for k in klines]
         volumes = [float(k[5]) for k in klines]
-        scores["volume"] = int((sum(volumes[-7:])/7)/(sum(volumes[-30:])/30)*50)
 
-    except:
-        scores.update({"volatility":50,"momentum":50,"volume":50})
+        returns  = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
+        vol_30   = _std(returns[-30:])
+        vol_90   = _std(returns)
 
+        scores["volatility"] = _clamp(int(100 - (vol_30 / vol_90 - 0.5) * 80) if vol_90 else 50)
+        scores["momentum"]   = _clamp(int(50 + (closes[-1] - closes[-30]) / closes[-30] * 200))
+        scores["volume"]     = _clamp(int((sum(volumes[-7:]) / 7) / (sum(volumes[-30:]) / 30) * 50))
+    except Exception as e:
+        print(f"[F&G] Binance klines lỗi: {e}")
+        scores.update({"volatility": 50, "momentum": 50, "volume": 50})
+
+    # 2. BTC Dominance + Market Cap Change (CoinGecko)
     try:
-        resp = await client.get("https://api.coingecko.com/api/v3/global")
-        d = resp.json()["data"]
+        resp    = await client.get("https://api.coingecko.com/api/v3/global")
+        data    = resp.json()["data"]
+        btc_dom = data["market_cap_percentage"]["btc"]
+        mkt_ch  = data["market_cap_change_percentage_24h_usd"]
 
-        btc_dom = d["market_cap_percentage"]["btc"]
-        total_ch = d["market_cap_change_percentage_24h_usd"]
+        scores["dominance"]   = _clamp(int(100 - (btc_dom - 40) * 2))
+        scores["market_cap"]  = _clamp(int(50 + mkt_ch * 3))
+    except Exception as e:
+        print(f"[F&G] CoinGecko lỗi: {e}")
+        scores.update({"dominance": 50, "market_cap": 50})
 
-        scores["dominance"] = int(100-(btc_dom-40)*2)
-        scores["market_cap"] = int(50+total_ch*3)
-    except:
-        scores.update({"dominance":50,"market_cap":50})
-
+    # 3. Social Sentiment (BTC 24h change)
     try:
         resp = await client.get(
             "https://api.binance.com/api/v3/ticker/24hr",
-            params={"symbol":"BTCUSDT"}
+            params={"symbol": "BTCUSDT"},
         )
         pct = float(resp.json()["priceChangePercent"])
-        scores["social"] = int(50+pct*4)
-    except:
+        scores["social"] = _clamp(int(50 + pct * 4))
+    except Exception as e:
+        print(f"[F&G] Social lỗi: {e}")
         scores["social"] = 50
 
     weights = {
-        "volatility":0.25,"momentum":0.25,"volume":0.15,
-        "dominance":0.10,"market_cap":0.15,"social":0.10
+        "volatility": 0.25,
+        "momentum":   0.25,
+        "volume":     0.15,
+        "dominance":  0.10,
+        "market_cap": 0.15,
+        "social":     0.10,
     }
-
-    final = int(sum(scores[k]*weights[k] for k in weights))
+    final = _clamp(int(sum(scores[k] * weights[k] for k in weights)))
 
     return {
         "value": final,
-        "classification":
-            "Extreme Greed" if final>=75 else
-            "Greed" if final>=56 else
-            "Neutral" if final>=45 else
-            "Fear" if final>=25 else "Extreme Fear",
-        "timestamp": int(datetime.now(timezone.utc).timestamp())
+        "classification": (
+            "Extreme Greed" if final >= 75 else
+            "Greed"         if final >= 56 else
+            "Neutral"       if final >= 45 else
+            "Fear"          if final >= 25 else
+            "Extreme Fear"
+        ),
+        "timestamp": int(datetime.now(timezone.utc).timestamp()),
     }
 
 
 async def fetch_fear_and_greed():
+    """Tính Fear & Greed mỗi 1 giờ, lưu vào Redis."""
     while True:
         try:
             async with httpx.AsyncClient(timeout=20) as client:
-                data = await calculate_fear_greed(client)
-
-            await async_redis_client.set("market_fear_greed", dumps(data))
-            print("[F&G]", data["value"], data["classification"])
-
+                data = await _calculate_fear_greed(client)
+            await async_redis_client.set(REDIS_KEY_FNG, dumps(data))
+            print(f"[F&G] {data['value']} – {data['classification']}")
         except Exception as e:
-            print("[F&G] lỗi:", e)
-
-        await asyncio.sleep(3600)
+            print(f"[F&G] Lỗi: {e}")
+        await asyncio.sleep(FNG_INTERVAL)
 
 
 # ══════════════════════════════════════════════════════════════════
-# METADATA
+# METADATA — 24h change & volume cho 24 coins
 # ══════════════════════════════════════════════════════════════════
 async def fetch_coin_metadata():
+    """Lấy metadata 24h từ Binance mỗi 1 giờ."""
     while True:
         try:
-            import json as _json  
+            import json as _stdlib_json
+            symbols_json = _stdlib_json.dumps(TRACKED_COINS, separators=(",", ":"))
 
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
                     "https://api.binance.com/api/v3/ticker/24hr",
-                    params={"symbols": _json.dumps(TRACKED_COINS, separators=(',', ':'))}
+                    params={"symbols": symbols_json},
                 )
-
             raw = resp.json()
 
-            # Kiểm tra Binance có trả về lỗi không
             if isinstance(raw, dict):
-                print("[Meta] Binance lỗi:", raw)
-                raise ValueError(f"Unexpected response: {raw}")
+                print(f"[Meta] Binance lỗi: {raw}")
+                raise ValueError(f"Unexpected: {raw}")
 
             meta = {}
             for item in raw:
                 sym = item["symbol"]
                 meta[sym] = {
-                    "coinName": NAME_MAP.get(sym, sym.replace("USDT", "")),
-                    "priceChangePercent": float(item["priceChangePercent"]),
-                    "quoteVolume": float(item["quoteVolume"])
+                    "coinName":           NAME_MAP.get(sym, SYMBOL_MAP.get(sym, sym)),
+                    "coinSymbol":         SYMBOL_MAP.get(sym, sym.replace("USDT", "")),
+                    "priceChangePercent": round(float(item["priceChangePercent"]), 2),
+                    "quoteVolume":        round(float(item["quoteVolume"]), 0),
+                    "highPrice":          float(item["highPrice"]),
+                    "lowPrice":           float(item["lowPrice"]),
+                    "lastPrice":          float(item["lastPrice"]),
                 }
 
             _meta_cache.clear()
             _meta_cache.update(meta)
 
-            await async_redis_client.set("top_coins_meta", dumps(meta))
-            print("[Meta] updated", len(meta), "coins")
+            await async_redis_client.set(REDIS_KEY_META, dumps(meta))
+            print(f"[Meta] Cập nhật {len(meta)} coins")
 
         except Exception as e:
-            print("[Meta] lỗi:", e)
+            print(f"[Meta] Lỗi: {e}")
 
-        await asyncio.sleep(META_FETCH_INTERVAL)
+        await asyncio.sleep(META_INTERVAL)
 
 
 # ══════════════════════════════════════════════════════════════════
-# FLUSH
+# FLUSH — ghi Redis mỗi 45 giây
 # ══════════════════════════════════════════════════════════════════
 async def _flush_live_prices():
     global _last_hash
 
     while True:
-        await asyncio.sleep(LIVE_PRICE_FLUSH_INTERVAL)
+        await asyncio.sleep(FLUSH_INTERVAL)
 
         if not _live_price_cache:
             continue
 
-        snapshot_live = dict(_live_price_cache)
-
+        # Merge live price + metadata
         snapshot = {}
-        for sym, live in snapshot_live.items():
-            entry = dict(live)
+        for sym, live in _live_price_cache.items():
+            entry = {
+                "symbol":     sym,
+                "name":       NAME_MAP.get(sym, sym.replace("USDT", "")),
+                "coinSymbol": SYMBOL_MAP.get(sym, sym.replace("USDT", "")),
+                "price":      live.get("price", 0),
+                "time":       live.get("time", 0),
+            }
             if sym in _meta_cache:
-                entry.update(_meta_cache[sym])
+                m = _meta_cache[sym]
+                entry["change"]      = m.get("priceChangePercent", 0)
+                entry["volume"]      = m.get("quoteVolume", 0)
+                entry["high24h"]     = m.get("highPrice", 0)
+                entry["low24h"]      = m.get("lowPrice", 0)
             snapshot[sym] = entry
 
-        payload = dumps(snapshot)
-        new_hash = hashlib.md5(payload).hexdigest()
+        # Tạo list cho app Android (đúng thứ tự TRACKED_COINS)
+        top_24_list = [
+            snapshot[sym]
+            for sym in TRACKED_COINS
+            if sym in snapshot
+        ]
 
+        payload_dict = dumps(snapshot)
+        payload_list = dumps(top_24_list)
+
+        new_hash = hashlib.md5(payload_list).hexdigest()
         if new_hash == _last_hash:
             continue
-
         _last_hash = new_hash
 
         try:
-            await async_redis_client.set("live_prices", payload)
-            print("[WS] flush", len(snapshot))
+            await async_redis_client.set(REDIS_KEY_LIVE,     payload_dict)  # dict by symbol
+            await async_redis_client.set(REDIS_KEY_TOP_COINS, payload_list)  # list cho app Android
+            print(f"[Flush] {len(top_24_list)} coins → Redis")
         except Exception as e:
-            print("[WS] flush lỗi:", e)
+            print(f"[Flush] Lỗi: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
-# WEBSOCKET
+# WEBSOCKET — Binance kline_1m stream
 # ══════════════════════════════════════════════════════════════════
 async def binance_ws():
-    retry = 5
+    retry_delay = 5
 
     while True:
         try:
-            async with websockets.connect(WS_URI) as ws:
-                print("[WS] connected")
-                retry = 5
+            async with websockets.connect(
+                WS_URI,
+                ping_interval=30,
+                ping_timeout=10,
+            ) as ws:
+                print(f"[WS] Kết nối Binance — {len(TRACKED_COINS)} coins")
+                retry_delay = 5  # reset khi kết nối thành công
 
                 while True:
                     raw = await ws.recv()
                     msg = loads(raw)
+
+                    # Multi-stream wrapper
                     if "data" in msg:
                         msg = msg["data"]
 
                     if "k" not in msg:
                         continue
 
-                    k = msg["k"]
+                    k   = msg["k"]
                     sym = msg["s"]
 
                     _live_price_cache[sym] = {
                         "price": float(k["c"]),
-                        "time": int(k["t"])
+                        "time":  int(k["t"]),
                     }
 
         except Exception as e:
-            print("[WS] lỗi:", e)
+            print(f"[WS] Mất kết nối: {e} — thử lại sau {retry_delay}s")
 
-        await asyncio.sleep(retry)
-        retry = min(retry*2, 60)
+        await asyncio.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, 60)  # exponential backoff tối đa 60s
 
 
 # ══════════════════════════════════════════════════════════════════
-# START
+# START — gọi từ lifespan FastAPI
 # ══════════════════════════════════════════════════════════════════
 async def start():
+    print("[Workers] Khởi động tất cả background tasks...")
     await asyncio.gather(
         fetch_fear_and_greed(),
         fetch_coin_metadata(),
