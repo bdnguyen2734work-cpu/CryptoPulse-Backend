@@ -156,7 +156,7 @@ async def fetch_coin_metadata():
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
                     "https://api.binance.com/api/v3/ticker/24hr",
-                    params={"symbols": _json.dumps(TRACKED_COINS)}  
+                    params={"symbols": _json.dumps(TRACKED_COINS, separators=(',', ':'))}
                 )
 
             raw = resp.json()
