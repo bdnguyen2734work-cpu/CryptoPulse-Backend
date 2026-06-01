@@ -3,18 +3,23 @@ workers.py – Background workers cho CryptoPulse.
   • Binance WebSocket → live price cache
   • Fear & Greed Index (tự tính từ Binance + CoinGecko)
   • Metadata 24h (change%, volume)
-  • Flush Redis mỗi 45s → top_24_coins_stats + live_prices
+  • Flush Redis mỗi 45s → top_20_coins_stats + live_prices
+  • Price Alert → Firebase FCM push notification
+  • Data Retention → xóa dữ liệu cũ lúc 3AM
 """
+
+try:
+    from database import async_redis_client, get_db_connection
+except ModuleNotFoundError:
+    from api.database import async_redis_client, get_db_connection
+
 import asyncio
 import httpx
 import math
 import hashlib
 import websockets
-from datetime import datetime, timezone
-try:
-    from database import async_redis_client, get_db_connection
-except ModuleNotFoundError:
-    from api.database import async_redis_client, get_db_connection
+from datetime import datetime, timezone, timedelta
+
 try:
     import orjson as _json
     def dumps(x): return _json.dumps(x)
@@ -23,6 +28,14 @@ except ImportError:
     import json as _json
     def dumps(x): return _json.dumps(x, ensure_ascii=False).encode()
     def loads(x): return _json.loads(x)
+
+# Firebase FCM
+try:
+    import firebase_admin
+    from firebase_admin import messaging
+    _firebase_ready = bool(firebase_admin._apps)
+except Exception:
+    _firebase_ready = False
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -68,15 +81,15 @@ SYMBOL_MAP = {s: s.replace("USDT", "") for s in TRACKED_COINS}
 WS_STREAMS = "/".join(f"{s.lower()}@kline_1m" for s in TRACKED_COINS)
 WS_URI     = f"wss://stream.binance.com:9443/stream?streams={WS_STREAMS}"
 
-FLUSH_INTERVAL     = 45    # giây — flush Redis
-META_INTERVAL      = 3600  # giây — refresh metadata
-FNG_INTERVAL       = 3600  # giây — refresh Fear & Greed
+FLUSH_INTERVAL = 45    # giây — flush Redis
+META_INTERVAL  = 3600  # giây — refresh metadata
+FNG_INTERVAL   = 3600  # giây — refresh Fear & Greed
 
 # Redis keys — đồng bộ với main.py
-REDIS_KEY_TOP_COINS  = "top_20_coins_stats"   # app Android đọc key này
-REDIS_KEY_LIVE       = "live_prices"           # internal
-REDIS_KEY_FNG        = "market_fear_greed"
-REDIS_KEY_META       = "top_coins_meta"
+REDIS_KEY_TOP_COINS = "top_20_coins_stats"
+REDIS_KEY_LIVE      = "live_prices"
+REDIS_KEY_FNG       = "market_fear_greed"
+REDIS_KEY_META      = "top_coins_meta"
 
 # In-memory cache
 _live_price_cache: dict = {}
@@ -104,19 +117,17 @@ def _clamp(val: int, lo: int = 0, hi: int = 100) -> int:
 async def _calculate_fear_greed(client: httpx.AsyncClient) -> dict:
     scores = {}
 
-    # 1. Volatility + Momentum + Volume (Binance BTC 90 ngày)
     try:
-        resp = await client.get(
+        resp    = await client.get(
             "https://api.binance.com/api/v3/klines",
             params={"symbol": "BTCUSDT", "interval": "1d", "limit": 90},
         )
         klines  = resp.json()
         closes  = [float(k[4]) for k in klines]
         volumes = [float(k[5]) for k in klines]
-
-        returns  = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
-        vol_30   = _std(returns[-30:])
-        vol_90   = _std(returns)
+        returns = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
+        vol_30  = _std(returns[-30:])
+        vol_90  = _std(returns)
 
         scores["volatility"] = _clamp(int(100 - (vol_30 / vol_90 - 0.5) * 80) if vol_90 else 50)
         scores["momentum"]   = _clamp(int(50 + (closes[-1] - closes[-30]) / closes[-30] * 200))
@@ -125,20 +136,17 @@ async def _calculate_fear_greed(client: httpx.AsyncClient) -> dict:
         print(f"[F&G] Binance klines lỗi: {e}")
         scores.update({"volatility": 50, "momentum": 50, "volume": 50})
 
-    # 2. BTC Dominance + Market Cap Change (CoinGecko)
     try:
         resp    = await client.get("https://api.coingecko.com/api/v3/global")
         data    = resp.json()["data"]
         btc_dom = data["market_cap_percentage"]["btc"]
         mkt_ch  = data["market_cap_change_percentage_24h_usd"]
-
-        scores["dominance"]   = _clamp(int(100 - (btc_dom - 40) * 2))
-        scores["market_cap"]  = _clamp(int(50 + mkt_ch * 3))
+        scores["dominance"]  = _clamp(int(100 - (btc_dom - 40) * 2))
+        scores["market_cap"] = _clamp(int(50 + mkt_ch * 3))
     except Exception as e:
         print(f"[F&G] CoinGecko lỗi: {e}")
         scores.update({"dominance": 50, "market_cap": 50})
 
-    # 3. Social Sentiment (BTC 24h change)
     try:
         resp = await client.get(
             "https://api.binance.com/api/v3/ticker/24hr",
@@ -151,12 +159,8 @@ async def _calculate_fear_greed(client: httpx.AsyncClient) -> dict:
         scores["social"] = 50
 
     weights = {
-        "volatility": 0.25,
-        "momentum":   0.25,
-        "volume":     0.15,
-        "dominance":  0.10,
-        "market_cap": 0.15,
-        "social":     0.10,
+        "volatility": 0.25, "momentum": 0.25, "volume": 0.15,
+        "dominance":  0.10, "market_cap": 0.15, "social": 0.10,
     }
     final = _clamp(int(sum(scores[k] * weights[k] for k in weights)))
 
@@ -174,7 +178,6 @@ async def _calculate_fear_greed(client: httpx.AsyncClient) -> dict:
 
 
 async def fetch_fear_and_greed():
-    """Tính Fear & Greed mỗi 1 giờ, lưu vào Redis."""
     while True:
         try:
             async with httpx.AsyncClient(timeout=20) as client:
@@ -190,19 +193,16 @@ async def fetch_fear_and_greed():
 # METADATA — 24h change & volume cho 24 coins
 # ══════════════════════════════════════════════════════════════════
 async def fetch_coin_metadata():
-    """Lấy metadata 24h từ Binance mỗi 1 giờ."""
     while True:
         try:
             import json as _stdlib_json
             symbols_json = _stdlib_json.dumps(TRACKED_COINS, separators=(",", ":"))
-
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
                     "https://api.binance.com/api/v3/ticker/24hr",
                     params={"symbols": symbols_json},
                 )
             raw = resp.json()
-
             if isinstance(raw, dict):
                 print(f"[Meta] Binance lỗi: {raw}")
                 raise ValueError(f"Unexpected: {raw}")
@@ -219,17 +219,116 @@ async def fetch_coin_metadata():
                     "lowPrice":           float(item["lowPrice"]),
                     "lastPrice":          float(item["lastPrice"]),
                 }
-
             _meta_cache.clear()
             _meta_cache.update(meta)
-
             await async_redis_client.set(REDIS_KEY_META, dumps(meta))
             print(f"[Meta] Cập nhật {len(meta)} coins")
-
         except Exception as e:
             print(f"[Meta] Lỗi: {e}")
-
         await asyncio.sleep(META_INTERVAL)
+
+
+# ══════════════════════════════════════════════════════════════════
+# PRICE ALERT — FCM Push Notification
+# ══════════════════════════════════════════════════════════════════
+async def _send_fcm(fcm_token: str, title: str, body: str):
+    """Gửi push notification qua Firebase FCM."""
+    if not _firebase_ready:
+        print(f"[Alert] Firebase chưa init — bỏ qua FCM")
+        return
+    try:
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            token=fcm_token,
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    sound="default",
+                    channel_id="price_alerts",
+                ),
+            ),
+        )
+        await asyncio.get_event_loop().run_in_executor(
+            None, messaging.send, message
+        )
+        print(f"[Alert] FCM gửi thành công → {fcm_token[:20]}...")
+    except Exception as e:
+        print(f"[Alert] FCM lỗi: {e}")
+
+
+async def check_price_alerts(snapshot: dict, fng_value: int):
+    """Kiểm tra tất cả alert đang active, gọi sau mỗi flush."""
+    conn = cursor = None
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT id, user_id, symbol, `condition`, target, fcm_token"
+            " FROM price_alerts WHERE is_active=1 AND triggered=0"
+        )
+        alerts = cursor.fetchall()
+
+        if not alerts:
+            return
+
+        triggered_ids = []
+
+        for alert in alerts:
+            sym       = alert["symbol"]
+            condition = alert["condition"]
+            target    = float(alert["target"])
+            fired     = False
+            title     = ""
+            body      = ""
+
+            # ── Cảnh báo giá coin ──────────────────────────────
+            if condition in ("above", "below") and sym in snapshot:
+                price = float(snapshot[sym].get("price", 0))
+                name  = snapshot[sym].get("name", sym)
+
+                if condition == "above" and price >= target:
+                    fired = True
+                    title = f"🚀 {name} vượt ngưỡng!"
+                    body  = f"{name} đang ở ${price:,.2f} — vượt mức ${target:,.2f} bạn đặt"
+
+                elif condition == "below" and price <= target:
+                    fired = True
+                    title = f"📉 {name} xuống ngưỡng!"
+                    body  = f"{name} đang ở ${price:,.2f} — dưới mức ${target:,.2f} bạn đặt"
+
+            # ── Cảnh báo Fear & Greed ──────────────────────────
+            elif condition == "fng_above" and fng_value >= int(target):
+                fired = True
+                title = "😱 Thị trường Tham lam cực độ!"
+                body  = f"Fear & Greed Index = {fng_value} — vượt ngưỡng {int(target)} bạn đặt"
+
+            elif condition == "fng_below" and fng_value <= int(target):
+                fired = True
+                title = "😨 Thị trường Sợ hãi cực độ!"
+                body  = f"Fear & Greed Index = {fng_value} — dưới ngưỡng {int(target)} bạn đặt"
+
+            if fired:
+                triggered_ids.append(alert["id"])
+                await _send_fcm(alert["fcm_token"], title, body)
+                print(f"[Alert] Fired #{alert['id']} — {title}")
+
+        # Đánh dấu đã fire — tắt alert
+        if triggered_ids:
+            placeholders = ",".join(["%s"] * len(triggered_ids))
+            cursor.execute(
+                f"UPDATE price_alerts SET triggered=1, is_active=0"
+                f" WHERE id IN ({placeholders})",
+                triggered_ids,
+            )
+            conn.commit()
+
+    except Exception as e:
+        print(f"[Alert] check_price_alerts lỗi: {e}")
+        if conn: conn.rollback()
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -244,7 +343,6 @@ async def _flush_live_prices():
         if not _live_price_cache:
             continue
 
-        # Merge live price + metadata
         snapshot = {}
         for sym, live in _live_price_cache.items():
             entry = {
@@ -256,13 +354,12 @@ async def _flush_live_prices():
             }
             if sym in _meta_cache:
                 m = _meta_cache[sym]
-                entry["change"]      = m.get("priceChangePercent", 0)
-                entry["volume"]      = m.get("quoteVolume", 0)
-                entry["high24h"]     = m.get("highPrice", 0)
-                entry["low24h"]      = m.get("lowPrice", 0)
+                entry["change"]  = m.get("priceChangePercent", 0)
+                entry["volume"]  = m.get("quoteVolume", 0)
+                entry["high24h"] = m.get("highPrice", 0)
+                entry["low24h"]  = m.get("lowPrice", 0)
             snapshot[sym] = entry
 
-        # Tạo list cho app Android (đúng thứ tự TRACKED_COINS)
         top_24_list = [
             snapshot[sym]
             for sym in TRACKED_COINS
@@ -278,9 +375,21 @@ async def _flush_live_prices():
         _last_hash = new_hash
 
         try:
-            await async_redis_client.set(REDIS_KEY_LIVE,     payload_dict)  # dict by symbol
-            await async_redis_client.set(REDIS_KEY_TOP_COINS, payload_list)  # list cho app Android
+            await async_redis_client.set(REDIS_KEY_LIVE,      payload_dict)
+            await async_redis_client.set(REDIS_KEY_TOP_COINS, payload_list)
             print(f"[Flush] {len(top_24_list)} coins → Redis")
+
+            # ── Kiểm tra Price Alert sau mỗi flush ──────────────
+            fng_raw = await async_redis_client.get(REDIS_KEY_FNG)
+            fng_val = 50
+            if fng_raw:
+                try:
+                    fng_val = loads(fng_raw).get("value", 50)
+                except Exception:
+                    pass
+            await check_price_alerts(snapshot, fng_val)
+            # ────────────────────────────────────────────────────
+
         except Exception as e:
             print(f"[Flush] Lỗi: {e}")
 
@@ -299,83 +408,72 @@ async def binance_ws():
                 ping_timeout=10,
             ) as ws:
                 print(f"[WS] Kết nối Binance — {len(TRACKED_COINS)} coins")
-                retry_delay = 5  # reset khi kết nối thành công
+                retry_delay = 5
 
                 while True:
                     raw = await ws.recv()
                     msg = loads(raw)
-
-                    # Multi-stream wrapper
                     if "data" in msg:
                         msg = msg["data"]
-
                     if "k" not in msg:
                         continue
-
                     k   = msg["k"]
                     sym = msg["s"]
-
                     _live_price_cache[sym] = {
                         "price": float(k["c"]),
                         "time":  int(k["t"]),
                     }
-
         except Exception as e:
             print(f"[WS] Mất kết nối: {e} — thử lại sau {retry_delay}s")
 
         await asyncio.sleep(retry_delay)
-        retry_delay = min(retry_delay * 2, 60)  # exponential backoff tối đa 60s
+        retry_delay = min(retry_delay * 2, 60)
+
 
 # ══════════════════════════════════════════════════════════════════
-# DATA RETENTION — tự động xóa dữ liệu cũ
+# DATA RETENTION — tự động xóa dữ liệu cũ lúc 3AM
 # ══════════════════════════════════════════════════════════════════
 RETENTION_POLICY = {
     "kline_1m":  7,   # giữ 7 ngày
     "kline_5m":  30,  # giữ 30 ngày
     "kline_15m": 90,  # giữ 90 ngày
-    # kline_1h, kline_4h, kline_1d, kline_1w: giữ toàn bộ
 }
 
 async def data_retention_worker():
-    """Chạy lúc 3AM mỗi ngày, xóa dữ liệu cũ theo RETENTION_POLICY."""
     import time as _time
-    from datetime import datetime
 
     while True:
-        # Chờ đến 3AM
-        now     = datetime.now()
-        target  = now.replace(hour=3, minute=0, second=0, microsecond=0)
-        from datetime import timedelta
+        now    = datetime.now()
+        target = now.replace(hour=3, minute=0, second=0, microsecond=0)
         if target <= now:
             target = target + timedelta(days=1)
+
         wait_seconds = (target - now).total_seconds()
         print(f"[Retention] Sẽ chạy lúc 3AM — còn {wait_seconds/3600:.1f}h")
         await asyncio.sleep(wait_seconds)
 
-        # Thực hiện xóa
         print("[Retention] Bắt đầu dọn dữ liệu cũ...")
         total_deleted = 0
 
         for table, days in RETENTION_POLICY.items():
             conn = cursor = None
             try:
-                cutoff = int(_time.time()) - (days * 86400)
-                conn   = get_db_connection()
-                cursor = conn.cursor()
-
-                # Xóa theo batch 10,000 rows để tránh lock table
+                cutoff  = int(_time.time()) - (days * 86400)
+                conn    = get_db_connection()
+                cursor  = conn.cursor()
                 deleted = 0
+
                 while True:
                     cursor.execute(
                         f"DELETE FROM {table} WHERE open_time < %s LIMIT 10000",
                         (cutoff,)
                     )
                     conn.commit()
-                    rows = cursor.rowcount
+                    rows     = cursor.rowcount
                     deleted += rows
                     if rows < 10000:
                         break
-                    await asyncio.sleep(0.5)  # nhường CPU giữa các batch
+                    await asyncio.sleep(0.5)
 
                 total_deleted += deleted
                 print(f"[Retention] {table}: xóa {deleted:,} rows (cũ hơn {days} ngày)")
@@ -388,8 +486,8 @@ async def data_retention_worker():
                 if conn:   conn.close()
 
         print(f"[Retention] Hoàn tất — tổng {total_deleted:,} rows đã xóa")
+        await asyncio.sleep(60)
 
-        await asyncio.sleep(60)  # tránh chạy lại ngay lập tức
 
 # ══════════════════════════════════════════════════════════════════
 # START — gọi từ lifespan FastAPI

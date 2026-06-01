@@ -1486,9 +1486,133 @@ async def crawl_worker_once():
             if conn:   conn.close()
     except Exception as e:
         print(f"[Crawl-Once] ❌ {e}")
+# ══════════════════════════════════════════════════════════════════
+#  20. PRICE ALERT ENDPOINTS
+# ══════════════════════════════════════════════════════════════════
+class AlertCreate(BaseModel):
+    symbol:     str    # "BTCUSDT" hoặc "FNG" cho Fear & Greed
+    condition:  str    # "above" | "below" | "fng_above" | "fng_below"
+    target:     float  # ngưỡng giá hoặc F&G value
+    fcm_token:  str    # Firebase token từ app Android
+
+
+@app.post("/api/v1/alerts", tags=["Alerts"])
+@limiter.limit("20/minute")
+async def create_alert(
+    request: Request,
+    data:    AlertCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    """Tạo cảnh báo giá mới."""
+    if data.condition not in ("above", "below", "fng_above", "fng_below"):
+        raise HTTPException(status_code=400,
+                            detail="condition phải là: above, below, fng_above, fng_below")
+    conn = cursor = None
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # Lấy user_id
+        cursor.execute("SELECT id FROM users WHERE username=%s",
+                       (current_user["username"],))
+        user = cursor.fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User không tồn tại.")
+
+        # Giới hạn 10 alert/user
+        cursor.execute(
+            "SELECT COUNT(*) AS cnt FROM price_alerts"
+            " WHERE user_id=%s AND is_active=1", (user["id"],))
+        if cursor.fetchone()["cnt"] >= 10:
+            raise HTTPException(status_code=400,
+                                detail="Tối đa 10 alert đang hoạt động.")
+
+        cursor.execute(
+            "INSERT INTO price_alerts"
+            " (user_id, symbol, `condition`, target, fcm_token)"
+            " VALUES (%s, %s, %s, %s, %s)",
+            (user["id"], data.symbol.upper(),
+             data.condition, data.target, data.fcm_token))
+        conn.commit()
+        alert_id = cursor.lastrowid
+
+        return {
+            "status":   "success",
+            "alert_id": alert_id,
+            "message":  f"Đã tạo cảnh báo: {data.symbol} {data.condition} {data.target}",
+        }
+    except HTTPException: raise
+    except Exception as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+@app.get("/api/v1/alerts", tags=["Alerts"])
+async def get_alerts(current_user: dict = Depends(get_current_user)):
+    """Lấy danh sách alert đang hoạt động của user."""
+    conn = cursor = None
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM users WHERE username=%s",
+                       (current_user["username"],))
+        user = cursor.fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User không tồn tại.")
+
+        cursor.execute(
+            "SELECT id, symbol, `condition`, target, is_active,"
+            " triggered, created_at"
+            " FROM price_alerts WHERE user_id=%s AND is_active=1"
+            " ORDER BY created_at DESC",
+            (user["id"],))
+        alerts = cursor.fetchall()
+        return {"status": "success", "count": len(alerts), "alerts": alerts}
+    except HTTPException: raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+@app.delete("/api/v1/alerts/{alert_id}", tags=["Alerts"])
+async def delete_alert(
+    alert_id:     int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Xóa (tắt) một alert theo id."""
+    conn = cursor = None
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM users WHERE username=%s",
+                       (current_user["username"],))
+        user = cursor.fetchone()
+
+        cursor.execute(
+            "UPDATE price_alerts SET is_active=0"
+            " WHERE id=%s AND user_id=%s",
+            (alert_id, user["id"]))
+        conn.commit()
+
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404,
+                                detail="Alert không tồn tại hoặc không có quyền.")
+        return {"status": "success", "message": f"Đã xóa alert #{alert_id}"}
+    except HTTPException: raise
+    except Exception as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
 
 # ══════════════════════════════════════════════════════════════════
-#  20. WEBSOCKET
+#  21. WEBSOCKET
 # ══════════════════════════════════════════════════════════════════
 @app.websocket("/ws/crypto/{symbol}")
 async def ws_crypto(websocket: WebSocket, symbol: str):
