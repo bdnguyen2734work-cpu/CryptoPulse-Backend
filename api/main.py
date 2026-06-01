@@ -425,21 +425,12 @@ app = FastAPI(
     description="Real-time crypto · Analysis · On-chain · News · Auth",
     lifespan=lifespan,
 )
+
 # ── Prometheus Metrics ────────────────────────────────────────────
 from prometheus_fastapi_instrumentator import Instrumentator
+Instrumentator().instrument(app).expose(app)
 
-Instrumentator(
-    should_group_status_codes=True,
-    should_ignore_untemplated=True,
-    should_respect_env_var=True,
-    should_instrument_requests_inprogress=True,
-    excluded_handlers=["/health", "/metrics"],
-    env_var_name="ENABLE_METRICS",
-    inprogress_name="http_requests_inprogress",
-    inprogress_labels=True,
-).instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
-
-# Rate limiter
+# ── Rate limiter ──────────────────────────────────────────────────
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
