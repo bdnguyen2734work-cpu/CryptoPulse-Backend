@@ -20,3 +20,4 @@ google-auth==2.29.0
 sqlalchemy==2.0.30
 pymysql==1.1.0
 slowapi==0.1.9
+prometheus-fastapi-instrumentator==6.1.0
