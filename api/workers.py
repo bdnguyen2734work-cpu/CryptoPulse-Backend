@@ -5,19 +5,16 @@ workers.py – Background workers cho CryptoPulse.
   • Metadata 24h (change%, volume)
   • Flush Redis mỗi 45s → top_24_coins_stats + live_prices
 """
-
-try:
-    from database import async_redis_client
-except ModuleNotFoundError:
-    from api.database import async_redis_client
-
 import asyncio
 import httpx
 import math
 import hashlib
 import websockets
 from datetime import datetime, timezone
-
+try:
+    from database import async_redis_client, get_db_connection
+except ModuleNotFoundError:
+    from api.database import async_redis_client, get_db_connection
 try:
     import orjson as _json
     def dumps(x): return _json.dumps(x)
@@ -329,6 +326,70 @@ async def binance_ws():
         await asyncio.sleep(retry_delay)
         retry_delay = min(retry_delay * 2, 60)  # exponential backoff tối đa 60s
 
+# ══════════════════════════════════════════════════════════════════
+# DATA RETENTION — tự động xóa dữ liệu cũ
+# ══════════════════════════════════════════════════════════════════
+RETENTION_POLICY = {
+    "kline_1m":  7,   # giữ 7 ngày
+    "kline_5m":  30,  # giữ 30 ngày
+    "kline_15m": 90,  # giữ 90 ngày
+    # kline_1h, kline_4h, kline_1d, kline_1w: giữ toàn bộ
+}
+
+async def data_retention_worker():
+    """Chạy lúc 3AM mỗi ngày, xóa dữ liệu cũ theo RETENTION_POLICY."""
+    import time as _time
+    from datetime import datetime
+
+    while True:
+        # Chờ đến 3AM
+        now     = datetime.now()
+        target  = now.replace(hour=3, minute=0, second=0, microsecond=0)
+        from datetime import timedelta
+        if target <= now:
+            target = target + timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        print(f"[Retention] Sẽ chạy lúc 3AM — còn {wait_seconds/3600:.1f}h")
+        await asyncio.sleep(wait_seconds)
+
+        # Thực hiện xóa
+        print("[Retention] Bắt đầu dọn dữ liệu cũ...")
+        total_deleted = 0
+
+        for table, days in RETENTION_POLICY.items():
+            conn = cursor = None
+            try:
+                cutoff = int(_time.time()) - (days * 86400)
+                conn   = get_db_connection()
+                cursor = conn.cursor()
+
+                # Xóa theo batch 10,000 rows để tránh lock table
+                deleted = 0
+                while True:
+                    cursor.execute(
+                        f"DELETE FROM {table} WHERE open_time < %s LIMIT 10000",
+                        (cutoff,)
+                    )
+                    conn.commit()
+                    rows = cursor.rowcount
+                    deleted += rows
+                    if rows < 10000:
+                        break
+                    await asyncio.sleep(0.5)  # nhường CPU giữa các batch
+
+                total_deleted += deleted
+                print(f"[Retention] {table}: xóa {deleted:,} rows (cũ hơn {days} ngày)")
+
+            except Exception as e:
+                print(f"[Retention] Lỗi {table}: {e}")
+                if conn: conn.rollback()
+            finally:
+                if cursor: cursor.close()
+                if conn:   conn.close()
+
+        print(f"[Retention] Hoàn tất — tổng {total_deleted:,} rows đã xóa")
+
+        await asyncio.sleep(60)  # tránh chạy lại ngay lập tức
 
 # ══════════════════════════════════════════════════════════════════
 # START — gọi từ lifespan FastAPI
@@ -340,4 +401,5 @@ async def start():
         fetch_coin_metadata(),
         binance_ws(),
         _flush_live_prices(),
+        data_retention_worker(),
     )
