@@ -926,7 +926,7 @@ async def get_kline_history(
 # ══════════════════════════════════════════════════════════════════
 #  17. AI TREND ANALYSIS
 # ══════════════════════════════════════════════════════════════════
-TF_MAP = {"h1":"1h","1d":"1d","1w":"1w"}
+TF_MAP = {"h1":"1h","4h":"4h","1d":"1d","1w":"1w"}
 
 @app.get("/api/v1/analysis/trend/{symbol}", tags=["Analysis"])
 @limiter.limit("20/minute")
