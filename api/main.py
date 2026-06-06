@@ -949,18 +949,15 @@ async def get_market_trend(
             fng_value = fng_obj.get("value", 50)
             fng_label = fng_obj.get("classification", "Neutral")
 
+        # ── Đọc dữ liệu kline từ TiDB Cloud ──────────────────────
         try:
-            with _analysis_engine.connect() as _conn:
-                df = pd.read_sql(
-                    _text(
-                        f"SELECT open_price AS open, high_price AS high,"
-                        f" low_price AS low, close_price AS close, volume"
-                        f" FROM kline_{db_tf} WHERE symbol=:sym"
-                        f" ORDER BY open_time DESC LIMIT 100"
-                    ),
-                    _conn,
-                    params={"sym": symbol},
-                )
+            df = pd.read_sql(
+                f"SELECT open_price AS open, high_price AS high,"
+                f" low_price AS low, close_price AS close, volume"
+                f" FROM kline_{db_tf} WHERE symbol = '{symbol}'"
+                f" ORDER BY open_time DESC LIMIT 100",
+                _analysis_engine,
+            )
         except Exception as e:
             raise HTTPException(status_code=404, detail=str(e))
 
@@ -968,6 +965,7 @@ async def get_market_trend(
             raise HTTPException(status_code=404, detail="Không đủ dữ liệu.")
         df = df.iloc[::-1].reset_index(drop=True)
 
+        # ── Tính chỉ số kỹ thuật ──────────────────────────────────
         rsi     = round(float(ta.rsi(df["close"], length=14).iloc[-1]), 2)
         macd_df = ta.macd(df["close"], fast=12, slow=26, signal=9)
         m_col   = [c for c in macd_df.columns if c.startswith("MACD_")][0]
@@ -1000,7 +998,10 @@ async def get_market_trend(
         high20 = round(float(df["high"].tail(20).max()), 2)
         low20  = round(float(df["low"].tail(20).min()),  2)
 
+        # ── Phân tích tín hiệu ────────────────────────────────────
         signals, scores = [], []
+
+        # RSI
         if rsi >= 70:
             signals.append({"indicator":"RSI","value":rsi,"signal":"SELL","note":"Vùng quá mua (>=70)"}); scores.append(20)
         elif rsi >= 55:
@@ -1012,6 +1013,7 @@ async def get_market_trend(
         else:
             signals.append({"indicator":"RSI","value":rsi,"signal":"NEUTRAL","note":"RSI trung tính (45-55)"}); scores.append(50)
 
+        # MACD
         if macd_val > macd_signal and macd_hist > 0:
             signals.append({"indicator":"MACD","value":macd_val,"signal":"BUY","note":"MACD cắt lên – Golden Cross"}); scores.append(75)
         elif macd_val < macd_signal and macd_hist < 0:
@@ -1019,11 +1021,13 @@ async def get_market_trend(
         else:
             signals.append({"indicator":"MACD","value":macd_val,"signal":"NEUTRAL","note":"MACD hội tụ"}); scores.append(50)
 
+        # EMA Cross
         if ema20 > ema50:
             signals.append({"indicator":"EMA Cross","value":f"{ema20}>{ema50}","signal":"BUY","note":"EMA20 trên EMA50"}); scores.append(70)
         else:
             signals.append({"indicator":"EMA Cross","value":f"{ema20}<{ema50}","signal":"SELL","note":"EMA20 dưới EMA50"}); scores.append(30)
 
+        # Bollinger Bands
         if cur_p > bb_upper:
             signals.append({"indicator":"Bollinger Bands","value":cur_p,"signal":"SELL","note":f"Giá vượt BB Upper ({bb_upper})"}); scores.append(25)
         elif cur_p < bb_lower:
@@ -1032,6 +1036,7 @@ async def get_market_trend(
             pos = round((cur_p-bb_lower)/(bb_upper-bb_lower)*100,1) if bb_upper!=bb_lower else 50
             signals.append({"indicator":"Bollinger Bands","value":cur_p,"signal":"NEUTRAL","note":f"Trong dải BB ({pos}%)"}); scores.append(50)
 
+        # Volume
         if volume_ratio >= 1.5:
             signals.append({"indicator":"Volume","value":round(last_vol,2),"signal":"STRONG","note":f"Volume cao ({volume_ratio}x TB)"})
         elif volume_ratio <= 0.5:
@@ -1039,6 +1044,7 @@ async def get_market_trend(
         else:
             signals.append({"indicator":"Volume","value":round(last_vol,2),"signal":"NORMAL","note":f"Volume bình thường ({volume_ratio}x TB)"})
 
+        # Fear & Greed
         if fng_value >= 75:
             signals.append({"indicator":"Fear & Greed","value":fng_value,"signal":"SELL","note":f"Tham lam cực độ ({fng_label})"}); scores.append(25)
         elif fng_value >= 55:
@@ -1048,6 +1054,7 @@ async def get_market_trend(
         else:
             signals.append({"indicator":"Fear & Greed","value":fng_value,"signal":"NEUTRAL","note":f"Trung tính ({fng_label})"}); scores.append(50)
 
+        # ── Kết luận ─────────────────────────────────────────────
         final = round(sum(scores)/len(scores), 2)
         if final >= 72:   trend,action,risk = "Tăng mạnh (Strong Bullish)","NÊN MUA – Xu hướng tăng rõ ràng","Thấp"
         elif final >= 58: trend,action,risk = "Tăng nhẹ (Bullish)","CÓ THỂ MUA – Cần theo dõi thêm","Trung bình"
@@ -1060,22 +1067,47 @@ async def get_market_trend(
                       else "Trung bình" if atr_pct>1.5 else "Thấp")
 
         return {
-            "symbol":symbol,"timeframe":tf,
-            "price":{"current":round(cur_p,4),"change":round(cur_p-old_p,4),
-                     "change_pct":pct,"high_20":high20,"low_20":low20,
-                     "support":low20,"resistance":high20},
-            "indicators":{"rsi":rsi,"macd":macd_val,"macd_signal":macd_signal,
-                          "macd_hist":macd_hist,"ema20":ema20,"ema50":ema50,
-                          "bb_upper":bb_upper,"bb_mid":bb_mid,"bb_lower":bb_lower,
-                          "atr":atr,"atr_pct":atr_pct,"volume_ratio":volume_ratio},
-            "market_sentiment":{"fear_greed_value":fng_value,"fear_greed_label":fng_label},
-            "analysis":{"score":final,"trend":trend,"action":action,"risk_level":risk,
-                        "volatility":volatility,
-                        "buy_signals":    sum(1 for s in signals if s["signal"]=="BUY"),
-                        "sell_signals":   sum(1 for s in signals if s["signal"]=="SELL"),
-                        "neutral_signals":sum(1 for s in signals if s["signal"]=="NEUTRAL")},
-            "signals":signals,
-            "timestamp":datetime.now(timezone.utc).isoformat(),
+            "symbol":  symbol,
+            "timeframe": tf,
+            "price": {
+                "current":    round(cur_p, 4),
+                "change":     round(cur_p - old_p, 4),
+                "change_pct": pct,
+                "high_20":    high20,
+                "low_20":     low20,
+                "support":    low20,
+                "resistance": high20,
+            },
+            "indicators": {
+                "rsi":          rsi,
+                "macd":         macd_val,
+                "macd_signal":  macd_signal,
+                "macd_hist":    macd_hist,
+                "ema20":        ema20,
+                "ema50":        ema50,
+                "bb_upper":     bb_upper,
+                "bb_mid":       bb_mid,
+                "bb_lower":     bb_lower,
+                "atr":          atr,
+                "atr_pct":      atr_pct,
+                "volume_ratio": volume_ratio,
+            },
+            "market_sentiment": {
+                "fear_greed_value": fng_value,
+                "fear_greed_label": fng_label,
+            },
+            "analysis": {
+                "score":           final,
+                "trend":           trend,
+                "action":          action,
+                "risk_level":      risk,
+                "volatility":      volatility,
+                "buy_signals":     sum(1 for s in signals if s["signal"] == "BUY"),
+                "sell_signals":    sum(1 for s in signals if s["signal"] == "SELL"),
+                "neutral_signals": sum(1 for s in signals if s["signal"] == "NEUTRAL"),
+            },
+            "signals":   signals,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except HTTPException: raise
     except Exception as e:
