@@ -136,16 +136,41 @@ async def _calculate_fear_greed(client: httpx.AsyncClient) -> dict:
         print(f"[F&G] Binance klines lỗi: {e}")
         scores.update({"volatility": 50, "momentum": 50, "volume": 50})
 
+    # ── SỬA: thêm alternative.me + dùng .get() cho CoinGecko ──────
+    fng_external = None
     try:
-        resp    = await client.get("https://api.coingecko.com/api/v3/global")
-        data    = resp.json()["data"]
-        btc_dom = data["market_cap_percentage"]["btc"]
-        mkt_ch  = data["market_cap_change_percentage_24h_usd"]
-        scores["dominance"]  = _clamp(int(100 - (btc_dom - 40) * 2))
-        scores["market_cap"] = _clamp(int(50 + mkt_ch * 3))
+        resp = await client.get(
+            "https://api.alternative.me/fng/?limit=1",
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            item         = resp.json().get("data", [{}])[0]
+            fng_external = int(item.get("value", 50))
+            print(f"[F&G] alternative.me: {fng_external}")
+    except Exception as e:
+        print(f"[F&G] alternative.me lỗi: {e}")
+
+    try:
+        resp = await client.get("https://api.coingecko.com/api/v3/global")
+        if resp.status_code == 200:
+            raw  = resp.json()
+            data = raw.get("data")  # ← dùng .get() thay vì ["data"]
+            if data and isinstance(data, dict):
+                btc_dom = data.get("market_cap_percentage", {}).get("btc", 50)
+                mkt_ch  = data.get("market_cap_change_percentage_24h_usd", 0)
+                scores["dominance"]  = _clamp(int(100 - (btc_dom - 40) * 2))
+                scores["market_cap"] = _clamp(int(50 + mkt_ch * 3))
+                print(f"[F&G] CoinGecko OK — BTC dom: {btc_dom:.1f}%")
+            else:
+                print(f"[F&G] CoinGecko: thiếu 'data' — dùng mặc định")
+                scores.update({"dominance": 50, "market_cap": 50})
+        else:
+            print(f"[F&G] CoinGecko HTTP {resp.status_code}")
+            scores.update({"dominance": 50, "market_cap": 50})
     except Exception as e:
         print(f"[F&G] CoinGecko lỗi: {e}")
         scores.update({"dominance": 50, "market_cap": 50})
+    # ───────────────────────────────────────────────────────────────
 
     try:
         resp = await client.get(
@@ -162,7 +187,15 @@ async def _calculate_fear_greed(client: httpx.AsyncClient) -> dict:
         "volatility": 0.25, "momentum": 0.25, "volume": 0.15,
         "dominance":  0.10, "market_cap": 0.15, "social": 0.10,
     }
-    final = _clamp(int(sum(scores[k] * weights[k] for k in weights)))
+    calculated = _clamp(int(sum(scores[k] * weights[k] for k in weights)))
+
+    # Blend với alternative.me nếu có
+    if fng_external is not None:
+        final = _clamp(int(calculated * 0.5 + fng_external * 0.5))
+    else:
+        final = calculated
+
+    print(f"[F&G] calc={calculated} | ext={fng_external} | final={final}")
 
     return {
         "value": final,
@@ -282,7 +315,6 @@ async def check_price_alerts(snapshot: dict, fng_value: int):
             title     = ""
             body      = ""
 
-            # ── Cảnh báo giá coin ──────────────────────────────
             if condition in ("above", "below") and sym in snapshot:
                 price = float(snapshot[sym].get("price", 0))
                 name  = snapshot[sym].get("name", sym)
@@ -297,7 +329,6 @@ async def check_price_alerts(snapshot: dict, fng_value: int):
                     title = f"📉 {name} xuống ngưỡng!"
                     body  = f"{name} đang ở ${price:,.2f} — dưới mức ${target:,.2f} bạn đặt"
 
-            # ── Cảnh báo Fear & Greed ──────────────────────────
             elif condition == "fng_above" and fng_value >= int(target):
                 fired = True
                 title = "😱 Thị trường Tham lam cực độ!"
@@ -313,7 +344,6 @@ async def check_price_alerts(snapshot: dict, fng_value: int):
                 await _send_fcm(alert["fcm_token"], title, body)
                 print(f"[Alert] Fired #{alert['id']} — {title}")
 
-        # Đánh dấu đã fire — tắt alert
         if triggered_ids:
             placeholders = ",".join(["%s"] * len(triggered_ids))
             cursor.execute(
@@ -379,7 +409,6 @@ async def _flush_live_prices():
             await async_redis_client.set(REDIS_KEY_TOP_COINS, payload_list)
             print(f"[Flush] {len(top_24_list)} coins → Redis")
 
-            # ── Kiểm tra Price Alert sau mỗi flush ──────────────
             fng_raw = await async_redis_client.get(REDIS_KEY_FNG)
             fng_val = 50
             if fng_raw:
@@ -388,7 +417,6 @@ async def _flush_live_prices():
                 except Exception:
                     pass
             await check_price_alerts(snapshot, fng_val)
-            # ────────────────────────────────────────────────────
 
         except Exception as e:
             print(f"[Flush] Lỗi: {e}")
