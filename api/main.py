@@ -926,7 +926,7 @@ async def get_kline_history(
 # ══════════════════════════════════════════════════════════════════
 #  17. AI TREND ANALYSIS
 # ══════════════════════════════════════════════════════════════════
-TF_MAP = {"h1":"1h","4h":"4h","1d":"1d","1w":"1w"}
+TF_MAP = {"h1": "1h", "4h": "4h", "1d": "1d", "1w": "1w"}
 
 @app.get("/api/v1/analysis/trend/{symbol}", tags=["Analysis"])
 @limiter.limit("20/minute")
@@ -938,10 +938,13 @@ async def get_market_trend(
     if tf not in TF_MAP:
         raise HTTPException(status_code=400, detail=f"Dùng: {list(TF_MAP)}")
     db_tf = TF_MAP[tf]
+
     try:
         symbol = symbol.upper()
-        if not symbol.endswith("USDT"): symbol += "USDT"
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
 
+        # ── Fear & Greed ──────────────────────────────────────────
         fng_raw = await async_redis_client.get("market_fear_greed")
         fng_value, fng_label = 50, "Neutral"
         if fng_raw:
@@ -949,24 +952,45 @@ async def get_market_trend(
             fng_value = fng_obj.get("value", 50)
             fng_label = fng_obj.get("classification", "Neutral")
 
-        # ── Đọc dữ liệu kline từ TiDB Cloud ──────────────────────
+        # ── Đọc kline từ TiDB bằng SQLAlchemy engine (dùng with connect) ──
+        query = _text(
+            f"SELECT open_price AS open, high_price AS high,"
+            f" low_price AS low, close_price AS close, volume"
+            f" FROM kline_{db_tf} WHERE symbol = :symbol"
+            f" ORDER BY open_time DESC LIMIT 100"
+        )
         try:
-            df = pd.read_sql(
-                f"SELECT open_price AS open, high_price AS high,"
-                f" low_price AS low, close_price AS close, volume"
-                f" FROM kline_{db_tf} WHERE symbol = '{symbol}'"
-                f" ORDER BY open_time DESC LIMIT 100",
-                _analysis_engine,
-            )
+            with _analysis_engine.connect() as conn_sa:
+                result = conn_sa.execute(query, {"symbol": symbol})
+                rows   = result.fetchall()
+                cols   = result.keys()
         except Exception as e:
-            raise HTTPException(status_code=404, detail=str(e))
+            raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Không có dữ liệu cho {symbol} / {db_tf}. "
+                       f"Kiểm tra lại tên bảng kline_{db_tf} và symbol."
+            )
+
+        df = pd.DataFrame(rows, columns=list(cols))
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna()
 
         if len(df) < 20:
-            raise HTTPException(status_code=404, detail="Không đủ dữ liệu.")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Không đủ dữ liệu: chỉ có {len(df)} nến (cần ít nhất 20)."
+            )
+
+        # Đảo lại: cũ → mới
         df = df.iloc[::-1].reset_index(drop=True)
 
         # ── Tính chỉ số kỹ thuật ──────────────────────────────────
         rsi     = round(float(ta.rsi(df["close"], length=14).iloc[-1]), 2)
+
         macd_df = ta.macd(df["close"], fast=12, slow=26, signal=9)
         m_col   = [c for c in macd_df.columns if c.startswith("MACD_")][0]
         ms_col  = [c for c in macd_df.columns if c.startswith("MACDs_")][0]
@@ -1003,71 +1027,72 @@ async def get_market_trend(
 
         # RSI
         if rsi >= 70:
-            signals.append({"indicator":"RSI","value":rsi,"signal":"SELL","note":"Vùng quá mua (>=70)"}); scores.append(20)
+            signals.append({"indicator": "RSI", "value": rsi, "signal": "SELL", "note": "Vùng quá mua (>=70)"}); scores.append(20)
         elif rsi >= 55:
-            signals.append({"indicator":"RSI","value":rsi,"signal":"BUY","note":"RSI tích cực"}); scores.append(70)
+            signals.append({"indicator": "RSI", "value": rsi, "signal": "BUY",  "note": "RSI tích cực"});         scores.append(70)
         elif rsi <= 30:
-            signals.append({"indicator":"RSI","value":rsi,"signal":"BUY","note":"Vùng quá bán (<=30)"}); scores.append(75)
+            signals.append({"indicator": "RSI", "value": rsi, "signal": "BUY",  "note": "Vùng quá bán (<=30)"}); scores.append(75)
         elif rsi <= 45:
-            signals.append({"indicator":"RSI","value":rsi,"signal":"SELL","note":"RSI yếu"}); scores.append(30)
+            signals.append({"indicator": "RSI", "value": rsi, "signal": "SELL", "note": "RSI yếu"});              scores.append(30)
         else:
-            signals.append({"indicator":"RSI","value":rsi,"signal":"NEUTRAL","note":"RSI trung tính (45-55)"}); scores.append(50)
+            signals.append({"indicator": "RSI", "value": rsi, "signal": "NEUTRAL", "note": "RSI trung tính (45-55)"}); scores.append(50)
 
         # MACD
         if macd_val > macd_signal and macd_hist > 0:
-            signals.append({"indicator":"MACD","value":macd_val,"signal":"BUY","note":"MACD cắt lên – Golden Cross"}); scores.append(75)
+            signals.append({"indicator": "MACD", "value": macd_val, "signal": "BUY",  "note": "MACD cắt lên – Golden Cross"}); scores.append(75)
         elif macd_val < macd_signal and macd_hist < 0:
-            signals.append({"indicator":"MACD","value":macd_val,"signal":"SELL","note":"MACD cắt xuống – Death Cross"}); scores.append(25)
+            signals.append({"indicator": "MACD", "value": macd_val, "signal": "SELL", "note": "MACD cắt xuống – Death Cross"}); scores.append(25)
         else:
-            signals.append({"indicator":"MACD","value":macd_val,"signal":"NEUTRAL","note":"MACD hội tụ"}); scores.append(50)
+            signals.append({"indicator": "MACD", "value": macd_val, "signal": "NEUTRAL", "note": "MACD hội tụ"}); scores.append(50)
 
         # EMA Cross
         if ema20 > ema50:
-            signals.append({"indicator":"EMA Cross","value":f"{ema20}>{ema50}","signal":"BUY","note":"EMA20 trên EMA50"}); scores.append(70)
+            signals.append({"indicator": "EMA Cross", "value": f"{ema20}>{ema50}", "signal": "BUY",  "note": "EMA20 trên EMA50"}); scores.append(70)
         else:
-            signals.append({"indicator":"EMA Cross","value":f"{ema20}<{ema50}","signal":"SELL","note":"EMA20 dưới EMA50"}); scores.append(30)
+            signals.append({"indicator": "EMA Cross", "value": f"{ema20}<{ema50}", "signal": "SELL", "note": "EMA20 dưới EMA50"}); scores.append(30)
 
         # Bollinger Bands
         if cur_p > bb_upper:
-            signals.append({"indicator":"Bollinger Bands","value":cur_p,"signal":"SELL","note":f"Giá vượt BB Upper ({bb_upper})"}); scores.append(25)
+            signals.append({"indicator": "Bollinger Bands", "value": cur_p, "signal": "SELL", "note": f"Giá vượt BB Upper ({bb_upper})"}); scores.append(25)
         elif cur_p < bb_lower:
-            signals.append({"indicator":"Bollinger Bands","value":cur_p,"signal":"BUY","note":f"Giá dưới BB Lower ({bb_lower})"}); scores.append(75)
+            signals.append({"indicator": "Bollinger Bands", "value": cur_p, "signal": "BUY",  "note": f"Giá dưới BB Lower ({bb_lower})"}); scores.append(75)
         else:
-            pos = round((cur_p-bb_lower)/(bb_upper-bb_lower)*100,1) if bb_upper!=bb_lower else 50
-            signals.append({"indicator":"Bollinger Bands","value":cur_p,"signal":"NEUTRAL","note":f"Trong dải BB ({pos}%)"}); scores.append(50)
+            pos = round((cur_p - bb_lower) / (bb_upper - bb_lower) * 100, 1) if bb_upper != bb_lower else 50
+            signals.append({"indicator": "Bollinger Bands", "value": cur_p, "signal": "NEUTRAL", "note": f"Trong dải BB ({pos}%)"}); scores.append(50)
 
         # Volume
         if volume_ratio >= 1.5:
-            signals.append({"indicator":"Volume","value":round(last_vol,2),"signal":"STRONG","note":f"Volume cao ({volume_ratio}x TB)"})
+            signals.append({"indicator": "Volume", "value": round(last_vol, 2), "signal": "STRONG", "note": f"Volume cao ({volume_ratio}x TB)"})
         elif volume_ratio <= 0.5:
-            signals.append({"indicator":"Volume","value":round(last_vol,2),"signal":"WEAK","note":f"Volume thấp ({volume_ratio}x TB)"})
+            signals.append({"indicator": "Volume", "value": round(last_vol, 2), "signal": "WEAK",   "note": f"Volume thấp ({volume_ratio}x TB)"})
         else:
-            signals.append({"indicator":"Volume","value":round(last_vol,2),"signal":"NORMAL","note":f"Volume bình thường ({volume_ratio}x TB)"})
+            signals.append({"indicator": "Volume", "value": round(last_vol, 2), "signal": "NORMAL", "note": f"Volume bình thường ({volume_ratio}x TB)"})
 
         # Fear & Greed
         if fng_value >= 75:
-            signals.append({"indicator":"Fear & Greed","value":fng_value,"signal":"SELL","note":f"Tham lam cực độ ({fng_label})"}); scores.append(25)
+            signals.append({"indicator": "Fear & Greed", "value": fng_value, "signal": "SELL", "note": f"Tham lam cực độ ({fng_label})"}); scores.append(25)
         elif fng_value >= 55:
-            signals.append({"indicator":"Fear & Greed","value":fng_value,"signal":"BUY","note":f"Tham lam ({fng_label})"}); scores.append(65)
+            signals.append({"indicator": "Fear & Greed", "value": fng_value, "signal": "BUY",  "note": f"Tham lam ({fng_label})"}); scores.append(65)
         elif fng_value <= 25:
-            signals.append({"indicator":"Fear & Greed","value":fng_value,"signal":"BUY","note":f"Sợ hãi cực độ ({fng_label})"}); scores.append(70)
+            signals.append({"indicator": "Fear & Greed", "value": fng_value, "signal": "BUY",  "note": f"Sợ hãi cực độ ({fng_label})"}); scores.append(70)
         else:
-            signals.append({"indicator":"Fear & Greed","value":fng_value,"signal":"NEUTRAL","note":f"Trung tính ({fng_label})"}); scores.append(50)
+            signals.append({"indicator": "Fear & Greed", "value": fng_value, "signal": "NEUTRAL", "note": f"Trung tính ({fng_label})"}); scores.append(50)
 
-        # ── Kết luận ─────────────────────────────────────────────
-        final = round(sum(scores)/len(scores), 2)
-        if final >= 72:   trend,action,risk = "Tăng mạnh (Strong Bullish)","NÊN MUA – Xu hướng tăng rõ ràng","Thấp"
-        elif final >= 58: trend,action,risk = "Tăng nhẹ (Bullish)","CÓ THỂ MUA – Cần theo dõi thêm","Trung bình"
-        elif final >= 45: trend,action,risk = "Đi ngang (Neutral)","QUAN SÁT – Chờ tín hiệu rõ hơn","Trung bình"
-        elif final >= 30: trend,action,risk = "Giảm nhẹ (Bearish)","THẬN TRỌNG – Hạn chế mua mới","Cao"
-        else:             trend,action,risk = "Giảm mạnh (Strong Bearish)","NÊN BÁN / TRÁNH MUA","Rất cao"
+        # ── Kết luận ──────────────────────────────────────────────
+        final = round(sum(scores) / len(scores), 2)
+        if   final >= 72: trend, action, risk = "Tăng mạnh (Strong Bullish)", "NÊN MUA – Xu hướng tăng rõ ràng",       "Thấp"
+        elif final >= 58: trend, action, risk = "Tăng nhẹ (Bullish)",         "CÓ THỂ MUA – Cần theo dõi thêm",        "Trung bình"
+        elif final >= 45: trend, action, risk = "Đi ngang (Neutral)",          "QUAN SÁT – Chờ tín hiệu rõ hơn",        "Trung bình"
+        elif final >= 30: trend, action, risk = "Giảm nhẹ (Bearish)",          "THẬN TRỌNG – Hạn chế mua mới",          "Cao"
+        else:             trend, action, risk = "Giảm mạnh (Strong Bearish)",  "NÊN BÁN / TRÁNH MUA",                   "Rất cao"
 
-        atr_pct    = round(atr/cur_p*100, 2)
-        volatility = ("Rất cao" if atr_pct>5 else "Cao" if atr_pct>3
-                      else "Trung bình" if atr_pct>1.5 else "Thấp")
+        atr_pct    = round(atr / cur_p * 100, 2)
+        volatility = ("Rất cao" if atr_pct > 5 else
+                      "Cao"     if atr_pct > 3 else
+                      "Trung bình" if atr_pct > 1.5 else "Thấp")
 
         return {
-            "symbol":  symbol,
+            "symbol":    symbol,
             "timeframe": tf,
             "price": {
                 "current":    round(cur_p, 4),
@@ -1109,7 +1134,9 @@ async def get_market_trend(
             "signals":   signals,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-    except HTTPException: raise
+
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
