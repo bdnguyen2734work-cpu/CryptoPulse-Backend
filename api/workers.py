@@ -217,6 +217,8 @@ async def fetch_fear_and_greed():
                 data = await _calculate_fear_greed(client)
             await async_redis_client.set(REDIS_KEY_FNG, dumps(data))
             print(f"[F&G] {data['value']} – {data['classification']}")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print(f"[F&G] Lỗi: {e}")
         await asyncio.sleep(FNG_INTERVAL)
@@ -256,6 +258,8 @@ async def fetch_coin_metadata():
             _meta_cache.update(meta)
             await async_redis_client.set(REDIS_KEY_META, dumps(meta))
             print(f"[Meta] Cập nhật {len(meta)} coins")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print(f"[Meta] Lỗi: {e}")
         await asyncio.sleep(META_INTERVAL)
@@ -418,6 +422,8 @@ async def _flush_live_prices():
                     pass
             await check_price_alerts(snapshot, fng_val)
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print(f"[Flush] Lỗi: {e}")
 
@@ -451,6 +457,9 @@ async def binance_ws():
                         "price": float(k["c"]),
                         "time":  int(k["t"]),
                     }
+        except asyncio.CancelledError:
+            print("[WS] Đang tắt WebSocket connection...")
+            raise
         except Exception as e:
             print(f"[WS] Mất kết nối: {e} — thử lại sau {retry_delay}s")
 
@@ -506,6 +515,9 @@ async def data_retention_worker():
                 total_deleted += deleted
                 print(f"[Retention] {table}: xóa {deleted:,} rows (cũ hơn {days} ngày)")
 
+            except asyncio.CancelledError:
+                if conn: conn.rollback()
+                raise
             except Exception as e:
                 print(f"[Retention] Lỗi {table}: {e}")
                 if conn: conn.rollback()

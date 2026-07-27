@@ -1,7 +1,3 @@
-"""
-db_utils.py – Helper kết nối MySQL dùng chung cho tất cả script.
-Dùng context manager để đảm bảo connection luôn được đóng.
-"""
 import mysql.connector
 from contextlib import contextmanager
 from config import DB_CONFIG

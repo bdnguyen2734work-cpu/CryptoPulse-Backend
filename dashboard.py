@@ -9,10 +9,11 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from dotenv import load_dotenv
 
 from config import SYMBOLS, APP_COIN_MAP
+from api.database import get_sqlalchemy_engine
 
 load_dotenv()
 
@@ -30,18 +31,7 @@ st.set_page_config(
 # ─────────────────────────────────────────
 @st.cache_resource
 def get_engine():
-    host     = os.getenv("DB_HOST", "localhost")
-    port     = os.getenv("DB_PORT", "4000")
-    user     = os.getenv("DB_USER", "root")
-    password = os.getenv("DB_PASSWORD", "")
-    database = os.getenv("DB_NAME", "cryptopulse")
-
-    url = (
-        f"mysql+pymysql://{user}:{password}"
-        f"@{host}:{port}/{database}"
-        f"?ssl_verify_cert=false&ssl_verify_identity=false"
-    )
-    return create_engine(url, pool_size=3, pool_recycle=1800, pool_pre_ping=True)
+    return get_sqlalchemy_engine()
 
 
 def query_df(sql: str) -> pd.DataFrame:
@@ -73,8 +63,9 @@ def calc_macd(series: pd.Series):
 
 
 # ─────────────────────────────────────────
-# Load dữ liệu lịch sử
+# Load dữ liệu lịch sử (Cache 5s để giảm tải DB)
 # ─────────────────────────────────────────
+@st.cache_data(ttl=5)
 def get_history(symbol: str, tf: str, limit: int = 500) -> pd.DataFrame:
     df = query_df(f"""
         SELECT symbol, open_time, open_price, high_price,

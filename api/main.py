@@ -23,9 +23,9 @@ import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
-from database import get_db_connection, async_redis_client
+from database import get_db_connection, async_redis_client, get_sqlalchemy_engine
 from workers import start
-from sqlalchemy import create_engine as _create_engine, text as _text
+from sqlalchemy import text as _text
 from google.oauth2 import id_token
 from google.auth.transport import requests
 
@@ -42,19 +42,7 @@ limiter = Limiter(
 # ══════════════════════════════════════════════════════════════════
 #  SQLALCHEMY ENGINE (analysis)
 # ══════════════════════════════════════════════════════════════════
-def _get_analysis_engine():
-    h  = os.getenv("DB_HOST",     "localhost")
-    p  = os.getenv("DB_PORT",     "4000")
-    u  = os.getenv("DB_USER",     "root")
-    pw = os.getenv("DB_PASSWORD", "")
-    db = os.getenv("DB_NAME",     "cryptopulse")
-    return _create_engine(
-        f"mysql+pymysql://{u}:{pw}@{h}:{p}/{db}"
-        f"?ssl_verify_cert=false&ssl_verify_identity=false",
-        pool_size=2, pool_recycle=1800,
-    )
-
-_analysis_engine = _get_analysis_engine()
+_analysis_engine = get_sqlalchemy_engine()
 
 # ══════════════════════════════════════════════════════════════════
 #  1. CẤU HÌNH
@@ -408,13 +396,19 @@ async def crawl_worker():
 # ══════════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print("[Lifespan] Khởi chạy các background tasks...")
     t1 = asyncio.create_task(start())
     t2 = asyncio.create_task(whale_news_worker())
     t3 = asyncio.create_task(crawl_worker())
     yield
+    print("[Lifespan] Đang tắt các background tasks...")
     for t in (t1, t2, t3):
         t.cancel()
-    await asyncio.gather(t1, t2, t3, return_exceptions=True)
+    results = await asyncio.gather(t1, t2, t3, return_exceptions=True)
+    for i, res in enumerate(results):
+        if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
+            print(f"[Lifespan] Lỗi tắt task t{i+1}: {res}")
+    print("[Lifespan] Đã dọn dẹp sạch các background tasks.")
 
 # ══════════════════════════════════════════════════════════════════
 #  9. APP INIT
@@ -1442,6 +1436,16 @@ async def unhide_whale_news(req: HideNewsRequest, admin: dict = Depends(get_admi
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+async def trigger_whale_news_update():
+    try:
+        print("[Background Task] Bắt đầu fetch & dịch Whale News ngầm...")
+        payload = await asyncio.wait_for(_build_whale_news_payload(), timeout=300)
+        await async_redis_client.setex("whale_institutional_news", 900,
+                                       json.dumps(payload, ensure_ascii=False))
+        print("[Background Task] Cập nhật Whale News thành công!")
+    except Exception as e:
+        print(f"[Background Task] Lỗi cập nhật Whale News: {e}")
+
 @app.get("/api/v1/news/whale", tags=["News"])
 @limiter.limit("20/minute")
 async def get_whale_news(
@@ -1451,17 +1455,20 @@ async def get_whale_news(
     limit:         int  = Query(20, le=40),
 ):
     try:
-        if force_refresh:
-            payload = await asyncio.wait_for(_build_whale_news_payload(), timeout=300)
-            await async_redis_client.setex("whale_institutional_news", 900,
-                                           json.dumps(payload, ensure_ascii=False))
-        else:
-            cached  = await async_redis_client.get("whale_institutional_news")
-            payload = json.loads(cached) if cached else await _build_whale_news_payload()
-            if not cached:
-                await async_redis_client.setex("whale_institutional_news", 900,
-                                               json.dumps(payload, ensure_ascii=False))
-
+        cached = await async_redis_client.get("whale_institutional_news")
+        
+        # Nếu force_refresh hoặc chưa có cache, kích hoạt update ngầm
+        if force_refresh or not cached:
+            asyncio.create_task(trigger_whale_news_update())
+            
+        if not cached:
+            return {
+                "status": "pending",
+                "message": "Dữ liệu đang được cập nhật & dịch, vui lòng thử lại sau.",
+                "data": []
+            }
+            
+        payload = json.loads(cached)
         data = payload.get("data", [])
 
         raw_hidden = await async_redis_client.smembers("hidden_whale_news")
@@ -1472,10 +1479,14 @@ async def get_whale_news(
         if coin:
             data = [n for n in data if coin.upper() in (n.get("coins") or [])]
 
-        return {"status":"success","count":len(data[:limit]),
-                "updated_at":payload.get("updated_at"),"filter_coin":coin,"data":data[:limit]}
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=503, detail="Đang xử lý, thử lại sau.")
+        return {
+            "status": "success",
+            "count": len(data[:limit]),
+            "updated_at": payload.get("updated_at"),
+            "filter_coin": coin,
+            "data": data[:limit],
+            "message": "Đang làm mới dữ liệu trong nền..." if force_refresh else None
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1545,6 +1556,7 @@ async def crawl_worker_once():
             if conn:   conn.close()
     except Exception as e:
         print(f"[Crawl-Once] ❌ {e}")
+
 # ══════════════════════════════════════════════════════════════════
 #  20. PRICE ALERT ENDPOINTS
 # ══════════════════════════════════════════════════════════════════

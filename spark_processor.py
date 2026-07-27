@@ -86,12 +86,19 @@ def upsert_to_mysql(partition, table_name: str):
     """Chạy bên trong executor – import cục bộ."""
     import mysql.connector, os
 
+    ssl_disabled = os.getenv("DB_SSL_DISABLED", "false").lower() == "true"
     cfg = {
-        "host":     os.getenv("MYSQL_HOST", "mysql"),
-        "user":     "root",
-        "password": os.getenv("MYSQL_ROOT_PASSWORD", "rootpassword"),
-        "database": "cryptopulse",
+        "host":     os.getenv("DB_HOST", "localhost"),
+        "port":     int(os.getenv("DB_PORT", 3306)),
+        "user":     os.getenv("DB_USER", "root"),
+        "password": os.getenv("DB_PASSWORD", ""),
+        "database": os.getenv("DB_NAME", "cryptopulse"),
     }
+    if not ssl_disabled:
+        cfg["ssl_disabled"] = False
+        cfg["ssl_verify_cert"] = False
+        cfg["ssl_verify_identity"] = False
+
     rows = [
         (r.symbol, r.open_time, r.open_p, r.high_p, r.low_p, r.close_p, r.volume_p)
         for r in partition
@@ -110,7 +117,7 @@ def upsert_to_mysql(partition, table_name: str):
                 high_price  = IF(VALUES(high_price)  > high_price,  VALUES(high_price),  high_price),
                 low_price   = IF(VALUES(low_price)   < low_price,   VALUES(low_price),   low_price),
                 close_price = VALUES(close_price),
-                volume      = VALUES(volume)
+                volume      = volume + VALUES(volume)
         """, rows)
         conn.commit()
         cursor.close()
@@ -127,12 +134,16 @@ def update_redis_ticker(partition):
     from redis import Redis
     import os
 
-    r = Redis(
-        host=os.getenv("REDIS_HOST", "redis"),
-        port=int(os.getenv("REDIS_PORT", 6379)),
-        db=0,
-        decode_responses=True,
-    )
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url:
+        r = Redis.from_url(redis_url, decode_responses=True)
+    else:
+        r = Redis(
+            host=os.getenv("REDIS_HOST", "localhost"),
+            port=int(os.getenv("REDIS_PORT", 6379)),
+            db=0,
+            decode_responses=True,
+        )
     pipe = r.pipeline()
     for row in partition:
         pipe.hset(f"kline:latest:{row.symbol}", mapping={

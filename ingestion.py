@@ -1,20 +1,13 @@
-"""
-ingestion.py – WebSocket Binance → Kafka producer.
-
-Cải tiến so với bản gốc:
-  • Không hardcode config (dùng config.py)
-  • Tách delivery_report rõ ràng
-  • Reconnect tự động khi mất kết nối WebSocket
-  • Rate-limit: 1 message/giây/symbol (giống bản gốc, nhưng dùng config)
-  • Log rõ ràng hơn
-"""
-
 import json
-import time
-import websocket
+import asyncio
+import websockets
 from confluent_kafka import Producer
+import os
+from dotenv import load_dotenv
 
 from config import KAFKA_BOOTSTRAP, KAFKA_TOPIC, SYMBOLS_SET
+
+load_dotenv()
 
 # ─────────────────────────────────────────
 # Kafka Producer
@@ -33,78 +26,77 @@ def delivery_report(err, msg):
         print(f"[Kafka ERROR] {err}")
 
 
-# ─────────────────────────────────────────
-# Rate-limit tracker
-# ─────────────────────────────────────────
-last_sent_time: dict[str, float] = {}
-SEND_INTERVAL = 1.0  # giây
+# Bộ đệm tích lũy ticker mới nhất cho mỗi symbol trong vòng 1 giây
+ticker_buffer = {}
+buffer_lock = asyncio.Lock()
 
 
-# ─────────────────────────────────────────
-# WebSocket handlers
-# ─────────────────────────────────────────
-def on_message(ws, message: str):
-    try:
-        raw_data = json.loads(message)
-        if not isinstance(raw_data, list):
-            return
-
-        now = time.time()
-        batch = {}
-
-        for ticker in raw_data:
-            symbol = ticker.get("s", "")
-            if symbol not in SYMBOLS_SET:
+async def kafka_flush_loop():
+    """Gửi dữ liệu aggregated từ buffer sang Kafka định kỳ mỗi 1 giây."""
+    while True:
+        await asyncio.sleep(1.0)
+        async with buffer_lock:
+            if not ticker_buffer:
                 continue
-            # Chống spam: bỏ qua nếu < SEND_INTERVAL kể từ lần gửi trước
-            if now - last_sent_time.get(symbol, 0) < SEND_INTERVAL:
-                continue
-            batch[symbol] = ticker
-            last_sent_time[symbol] = now
+            batch = list(ticker_buffer.values())
+            ticker_buffer.clear()
 
-        if not batch:
-            return
+        try:
+            payload = json.dumps(batch)
+            producer.produce(KAFKA_TOPIC, value=payload, callback=delivery_report)
+            producer.poll(0)
 
-        payload = json.dumps(list(batch.values()))
-        producer.produce(KAFKA_TOPIC, value=payload, callback=delivery_report)
-        producer.poll(0)
-
-        top = next(iter(batch))
-        print(f"[Kafka] Gửi {len(batch)} coin | Top: {top} @ {batch[top]['c']}")
-
-    except Exception as exc:
-        print(f"[on_message ERROR] {exc}")
+            top = batch[0]["s"]
+            print(f"[Kafka] Gửi batch {len(batch)} coins | Top: {top} @ {batch[0]['c']}")
+        except Exception as e:
+            print(f"[Kafka Send Error] {e}")
 
 
-def on_open(ws):
-    print(f"[WS] Đã kết nối Binance | Theo dõi {len(SYMBOLS_SET)} coin")
+async def binance_ws_listener():
+    """Lắng nghe kết nối WebSocket từ Binance MiniTicker stream."""
+    binance_ws_url = "wss://stream.binance.com:9443/ws/!miniTicker@arr"
+    retry_delay = 5
 
-
-def on_error(ws, error):
-    print(f"[WS ERROR] {error}")
-
-
-def on_close(ws, code, msg):
-    print(f"[WS] Đóng kết nối (code={code}) – sẽ reconnect sau 5s...")
-
-
-# ─────────────────────────────────────────
-# Main – reconnect loop
-# ─────────────────────────────────────────
-BINANCE_WS = "wss://stream.binance.com:9443/ws/!miniTicker@arr"
-
-if __name__ == "__main__":
     while True:
         try:
-            ws = websocket.WebSocketApp(
-                BINANCE_WS,
-                on_message=on_message,
-                on_open=on_open,
-                on_error=on_error,
-                on_close=on_close,
-            )
-            ws.run_forever(ping_interval=30, ping_timeout=10)
-        except Exception as exc:
-            print(f"[Main ERROR] {exc}")
-        print("Reconnect sau 5 giây...")
-        time.sleep(5)
+            print(f"[WS] Kết nối tới Binance MiniTicker stream...")
+            async with websockets.connect(binance_ws_url, ping_interval=30, ping_timeout=10) as ws:
+                print(f"[WS] Kết nối thành công! Đang lắng nghe {len(SYMBOLS_SET)} coins.")
+                retry_delay = 5
+
+                async for message in ws:
+                    try:
+                        raw_data = json.loads(message)
+                        if not isinstance(raw_data, list):
+                            continue
+
+                        async with buffer_lock:
+                            for ticker in raw_data:
+                                symbol = ticker.get("s", "")
+                                if symbol in SYMBOLS_SET:
+                                    # Tích lũy: chỉ lưu bản tin mới nhất của symbol trong giây đó
+                                    ticker_buffer[symbol] = ticker
+                    except Exception as exc:
+                        print(f"[WS Parser Error] {exc}")
+
+        except asyncio.CancelledError:
+            print("[WS] Đang dừng Ingestion listener...")
+            raise
+        except Exception as e:
+            print(f"[WS Error] Kết nối lỗi: {e} - thử lại sau {retry_delay}s")
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+
+
+async def main():
+    await asyncio.gather(
+        binance_ws_listener(),
+        kafka_flush_loop()
+    )
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("[Main] Đã dừng bởi người dùng.")
